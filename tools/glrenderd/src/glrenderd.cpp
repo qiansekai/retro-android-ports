@@ -13,8 +13,12 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <poll.h>
 #include <pthread.h>
 #include <linux/fb.h>
+#include "drm/drm.h"
+#include "drm/drm_mode.h"
+#include "drm/drm_fourcc.h"
 #include <dlfcn.h>
 #include <signal.h>
 #include <unwind.h>
@@ -37,6 +41,16 @@ struct Panel {
     uint32_t back;
     bool flips;
     bool swapRB;
+    bool drm;
+    uint32_t width;
+    uint32_t height;
+    uint32_t fb_id[2];
+    uint32_t crtc_id;
+    uint32_t conn_id;
+    uint8_t* drm_base[2];
+    int dmabuf_fd[2];
+    uint64_t flip_seq;
+    struct drm_mode_modeinfo mode;
     struct fb_var_screeninfo var;
 };
 
@@ -134,6 +148,126 @@ static bool open_panel(Panel* p)
     return true;
 }
 
+static int drm_ioctl(int fd, unsigned long req, void* arg, const char* what)
+{
+    int r = ioctl(fd, req, arg);
+    if (r < 0)
+        fprintf(stderr, "glrenderd: %s ioctl %#lx failed: %s\n", what, req, strerror(errno));
+    return r;
+}
+
+// DRM/KMS panel for targets without fbdev (raphael). Uses a dumb buffer
+// exported as a dma-buf: 32-bit userspace cannot mmap the 4 GiB fake
+// offset MAP_DUMB returns, but mmap(dma-buf fd, 0) works.
+static bool open_panel_drm(Panel* p)
+{
+    memset(p, 0, sizeof(*p));
+    p->fd = open("/dev/dri/card0", O_RDWR);
+    if (p->fd < 0) {
+        perror("glrenderd: card0");
+        return false;
+    }
+    if (ioctl(p->fd, DRM_IOCTL_SET_MASTER, 0) < 0)
+        fprintf(stderr, "glrenderd: SET_MASTER failed: %s\n", strerror(errno));
+
+    struct drm_mode_card_res res;
+    memset(&res, 0, sizeof(res));
+    if (drm_ioctl(p->fd, DRM_IOCTL_MODE_GETRESOURCES, &res, "GETRESOURCES") < 0)
+        return false;
+    uint32_t conn_ids[8] = {0}, crtc_ids[8] = {0}, enc_ids[8] = {0};
+    res.connector_id_ptr = (uint64_t)(uintptr_t)conn_ids;
+    res.crtc_id_ptr = (uint64_t)(uintptr_t)crtc_ids;
+    res.encoder_id_ptr = (uint64_t)(uintptr_t)enc_ids;
+    if (drm_ioctl(p->fd, DRM_IOCTL_MODE_GETRESOURCES, &res, "GETRESOURCES2") < 0)
+        return false;
+    if (!res.count_connectors || !res.count_crtcs)
+        return false;
+
+    uint32_t conn_id = conn_ids[0];
+    struct drm_mode_get_connector conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.connector_id = conn_id;
+    if (drm_ioctl(p->fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn, "GETCONNECTOR") < 0)
+        return false;
+    struct drm_mode_modeinfo modes[8];
+    uint32_t encs[8], props[16];
+    uint64_t pvals[16];
+    conn.modes_ptr = (uint64_t)(uintptr_t)modes;
+    conn.encoders_ptr = (uint64_t)(uintptr_t)encs;
+    conn.props_ptr = (uint64_t)(uintptr_t)props;
+    conn.prop_values_ptr = (uint64_t)(uintptr_t)pvals;
+    if (drm_ioctl(p->fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn, "GETCONNECTOR2") < 0)
+        return false;
+    if (!conn.count_modes)
+        return false;
+    struct drm_mode_modeinfo mode = modes[0];
+
+    uint32_t enc_id = conn.encoder_id ? conn.encoder_id : encs[0];
+    struct drm_mode_get_encoder enc;
+    memset(&enc, 0, sizeof(enc));
+    enc.encoder_id = enc_id;
+    if (drm_ioctl(p->fd, DRM_IOCTL_MODE_GETENCODER, &enc, "GETENCODER") < 0)
+        return false;
+    p->crtc_id = enc.crtc_id ? enc.crtc_id : crtc_ids[0];
+    p->conn_id = conn_id;
+    p->width = mode.hdisplay;
+    p->height = mode.vdisplay;
+    p->mode = mode;
+    p->drm = true;
+    p->flips = true;
+    p->swapRB = true;
+
+    for (int i = 0; i < 2; i++) {
+        struct drm_mode_create_dumb dumb;
+        memset(&dumb, 0, sizeof(dumb));
+        dumb.width = p->width;
+        dumb.height = p->height;
+        dumb.bpp = 32;
+        if (drm_ioctl(p->fd, DRM_IOCTL_MODE_CREATE_DUMB, &dumb, "CREATE_DUMB") < 0)
+            return false;
+        struct drm_prime_handle prime;
+        memset(&prime, 0, sizeof(prime));
+        prime.handle = dumb.handle;
+        prime.flags = DRM_CLOEXEC | DRM_RDWR;
+        if (drm_ioctl(p->fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime, "PRIME_HANDLE_TO_FD") < 0)
+            return false;
+        p->dmabuf_fd[i] = prime.fd;
+        p->drm_base[i] = (uint8_t*)mmap(NULL, dumb.size, PROT_READ | PROT_WRITE,
+                MAP_SHARED, prime.fd, 0);
+        if (p->drm_base[i] == MAP_FAILED) {
+            perror("glrenderd: drm mmap");
+            return false;
+        }
+        p->stride = dumb.pitch;
+        struct drm_mode_fb_cmd2 addfb;
+        memset(&addfb, 0, sizeof(addfb));
+        addfb.width = p->width;
+        addfb.height = p->height;
+        addfb.pixel_format = DRM_FORMAT_XRGB8888;
+        addfb.handles[0] = dumb.handle;
+        addfb.pitches[0] = dumb.pitch;
+        if (drm_ioctl(p->fd, DRM_IOCTL_MODE_ADDFB2, &addfb, "ADDFB2") < 0)
+            return false;
+        p->fb_id[i] = addfb.fb_id;
+    }
+
+    p->back = 0;
+    struct drm_mode_crtc crtc;
+    memset(&crtc, 0, sizeof(crtc));
+    crtc.crtc_id = p->crtc_id;
+    crtc.fb_id = p->fb_id[0];
+    crtc.set_connectors_ptr = (uint64_t)(uintptr_t)&p->conn_id;
+    crtc.count_connectors = 1;
+    crtc.mode_valid = 1;
+    crtc.mode = mode;
+    if (drm_ioctl(p->fd, DRM_IOCTL_MODE_SETCRTC, &crtc, "SETCRTC") < 0)
+        return false;
+
+    fprintf(stderr, "glrenderd: DRM panel %ux%u stride %u conn %u crtc %u\n",
+            p->width, p->height, p->stride, p->conn_id, p->crtc_id);
+    return true;
+}
+
 // readback comes out top-down as r,g,b,a bytes, which fb0 takes as is unless it's bgra.
 // the guest screen can be an integer fraction of the panel, pixels get repeated to fill it.
 //
@@ -165,12 +299,16 @@ static void present(Presenter* pr, const uint8_t* pixels)
     Panel* p = pr->panel;
     int width = pr->width, height = pr->height;
     long long t0 = GetCurrentTimeMS();
-    uint32_t scale = p->var.xres / width;
+    uint32_t scale = p->width / width;
     if (scale < 1)
         scale = 1;
-    uint32_t w = width * scale > p->var.xres ? p->var.xres / scale : width;
-    uint32_t h = height * scale > p->var.yres ? p->var.yres / scale : height;
-    uint8_t* dst = p->base + p->back * p->var.yres * p->stride;
+    uint32_t w = width * scale > p->width ? p->width / scale : width;
+    uint32_t h = height * scale > p->height ? p->height / scale : height;
+    uint8_t* dst;
+    if (p->drm)
+        dst = p->drm_base[p->back];
+    else
+        dst = p->base + p->back * p->var.yres * p->stride;
     for (uint32_t y = 0; y < h; y++) {
         const uint32_t* src = (const uint32_t*)(pixels + y * width * 4);
         if (p->swapRB) {
@@ -191,16 +329,52 @@ static void present(Presenter* pr, const uint8_t* pixels)
     long long t1 = GetCurrentTimeMS();
     s_copyMs += t1 - t0;
     if (p->flips) {
-        // flip the same way the stock gralloc's fb_post does (FBIOPUT_VSCREENINFO with a new
-        // yoffset). on maple's mdss_mdp_overlay the FBIOPAN_DISPLAY path logs "unable to
-        // allocate base pipe" and returns success WITHOUT moving the offset, so the panel
-        // stays frozen while fb0 holds correct frames. FBIOPUT goes through set_par, which
-        // is what actually re-arms the overlay here. (the ported comment about set_par
-        // "redoing the whole mode" was from pdx203's drm path, not this fbdev one.)
-        p->var.yoffset = p->back * p->var.yres;
-        p->var.activate = FB_ACTIVATE_VBL;
-        if (ioctl(p->fd, FBIOPUT_VSCREENINFO, &p->var) < 0)
-            perror("glrenderd: flip");
+        if (p->drm) {
+            /* PAGE_FLIP, not SETCRTC: a modeset every frame resets the
+             * SDE panel (visible as a one-frame flash then black). The
+             * initial mode/connector setup happened in open_panel_drm. */
+            struct drm_mode_crtc_page_flip flip;
+            memset(&flip, 0, sizeof(flip));
+            flip.crtc_id = p->crtc_id;
+            flip.fb_id = p->fb_id[p->back];
+            flip.flags = DRM_MODE_PAGE_FLIP_EVENT;
+            flip.user_data = ++p->flip_seq;
+            if (drm_ioctl(p->fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip, "PAGE_FLIP") == 0) {
+                struct pollfd pfd;
+                pfd.fd = p->fd;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                if (poll(&pfd, 1, 200) > 0) {
+                    char evbuf[256];
+                    read(p->fd, evbuf, sizeof(evbuf));
+                }
+            } else {
+                /* fall back to a full modeset so the frame still reaches
+                 * the panel (flickers, but visible). */
+                struct drm_mode_crtc crtc;
+                memset(&crtc, 0, sizeof(crtc));
+                crtc.crtc_id = p->crtc_id;
+                crtc.fb_id = p->fb_id[p->back];
+                crtc.set_connectors_ptr = (uint64_t)(uintptr_t)&p->conn_id;
+                crtc.count_connectors = 1;
+                crtc.mode_valid = 1;
+                crtc.mode = p->mode;
+                if (drm_ioctl(p->fd, DRM_IOCTL_MODE_SETCRTC, &crtc, "SETCRTC") < 0)
+                    perror("glrenderd: drm flip");
+            }
+        } else {
+            // flip the same way the stock gralloc's fb_post does
+            // (FBIOPUT_VSCREENINFO with a new yoffset). on maple's
+            // mdss_mdp_overlay the FBIOPAN_DISPLAY path logs "unable to
+            // allocate base pipe" and returns success WITHOUT moving the
+            // offset, so the panel stays frozen while fb0 holds correct
+            // frames. FBIOPUT goes through set_par, which is what actually
+            // re-arms the overlay here.
+            p->var.yoffset = p->back * p->var.yres;
+            p->var.activate = FB_ACTIVATE_VBL;
+            if (ioctl(p->fd, FBIOPUT_VSCREENINFO, &p->var) < 0)
+                perror("glrenderd: flip");
+        }
         p->back ^= 1;
     }
     long long flip = GetCurrentTimeMS() - t1;
@@ -209,6 +383,18 @@ static void present(Presenter* pr, const uint8_t* pixels)
         s_flipMax = flip;
 
     if (++s_frames % 60 == 0) {
+        unsigned long nz = 0, nzd = 0;
+        const uint32_t* px = (const uint32_t*)pixels;
+        const uint32_t* dpx = (const uint32_t*)dst;
+        for (uint32_t sy = 0; sy < h; sy += 16)
+            for (uint32_t sx = 0; sx < w; sx += 16) {
+                if (px[sy * width + sx])
+                    nz++;
+                if (dpx[sy * (p->stride / 4) + sx])
+                    nzd++;
+            }
+        fprintf(stderr, "glrenderd: frame %lu nz=%lu nzd=%lu back=%u drm=%d\n",
+                s_frames, nz, nzd, p->back, p->drm);
         long long now = GetCurrentTimeMS();
         fprintf(stderr, "glrenderd: %.1f fps shown, per frame readback %.1fms copy %.1fms flip %.1fms"
                         " (max %lldms) posts=%lu drops=%lu postgap %.1fms stage %.1fms\n",
@@ -312,7 +498,7 @@ static bool start_presenter(Presenter* pr, Panel* panel, int width, int height)
     for (int i = 0; i < 3; i++)
         if (!(pr->slots[i] = (uint8_t*)malloc(width * height * 4)))
             return false;
-    if (!(pr->row = (uint32_t*)malloc(panel->var.xres * 4)))
+    if (!(pr->row = (uint32_t*)malloc(panel->width * 4)))
         return false;
     if (!(pr->swapped = (uint32_t*)malloc(width * 4)))
         return false;
@@ -368,6 +554,7 @@ int main(int argc, char** argv)
     int width = atoi(argv[1]);
     int height = atoi(argv[2]);
     bool to_fb = argc > 3 && !strcmp(argv[3], "-fb");
+    bool to_drm = argc > 3 && !strcmp(argv[3], "-drm");
 
     // the 32-bit adreno closure, wire format pointers are 32-bit so this daemon is too
     setenv("ANDROID_EGL_LIB", "/vendor/lib/egl/libEGL_adreno.so", 0);
@@ -390,8 +577,10 @@ int main(int argc, char** argv)
     static Panel panel;
     if (to_fb && (!open_panel(&panel) || !start_presenter(&s_pres, &panel, width, height)))
         return 1;
-    FrameBuffer::getFB()->setPostCallback(on_post, to_fb ? &s_pres : nullptr);
-    if (to_fb)
+    if (to_drm && (!open_panel_drm(&panel) || !start_presenter(&s_pres, &panel, width, height)))
+        return 1;
+    FrameBuffer::getFB()->setPostCallback(on_post, (to_fb || to_drm) ? &s_pres : nullptr);
+    if (to_fb || to_drm)
         FrameBuffer::getFB()->setPostReadback(present_acquire, &s_pres);
 
     char addr[256];

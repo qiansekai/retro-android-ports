@@ -1,0 +1,33 @@
+# configfs USB gadget for raphael (4.14 kernel; the old android_usb
+# driver is gone, so /sys/class/android_usb writes fail silently).
+# ported from pdx203-jellybean by @chardidathing
+on fs
+    # KitKat adbd only writes FS/HS descriptors; at super-speed the
+    # config comes up empty. Force high speed.
+    write /sys/devices/soc/a600000.ssusb/speed high
+    mount configfs none /config
+    mkdir /config/usb_gadget/g1 0770 shell shell
+    write /config/usb_gadget/g1/idVendor 0x18d1
+    write /config/usb_gadget/g1/idProduct 0x4ee7
+    write /config/usb_gadget/g1/bcdUSB 0x0200
+    mkdir /config/usb_gadget/g1/strings/0x409 0770 shell shell
+    write /config/usb_gadget/g1/strings/0x409/serialnumber raphaelkk
+    write /config/usb_gadget/g1/strings/0x409/manufacturer Xiaomi
+    write /config/usb_gadget/g1/strings/0x409/product raphael-kitkat
+    mkdir /config/usb_gadget/g1/configs/b.1 0770 shell shell
+    mkdir /config/usb_gadget/g1/configs/b.1/strings/0x409 0770 shell shell
+    write /config/usb_gadget/g1/configs/b.1/strings/0x409/configuration adb
+    mkdir /config/usb_gadget/g1/functions/ffs.adb
+    symlink /config/usb_gadget/g1/functions/ffs.adb /config/usb_gadget/g1/configs/b.1/f1
+    mkdir /dev/usb-ffs 0770 shell shell
+    mkdir /dev/usb-ffs/adb 0770 shell shell
+    mount functionfs adb /dev/usb-ffs/adb uid=2000,gid=2000
+
+on property:sys.usb.config=adb
+    start adbd
+    start usbudc
+
+# See usbudc.sh: bind once adbd wrote its descriptors and again whenever
+# adbd drops the UDC.
+service usbudc /system/bin/sh /sbin/usbudc.sh
+    disabled

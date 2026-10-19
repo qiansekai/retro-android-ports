@@ -1,0 +1,21 @@
+#
+# system.prop for raphael (KitKat)
+#
+# Display: measured 1080x2340, ro.sf.lcd_density=440 on LineageOS 23.2.
+ro.sf.lcd_density=440
+qemu.sf.lcd_density=440
+
+wifi.interface=wlan0
+
+# Must match full_raphael.mk + OTA asserts.
+ro.product.model=Redmi K20 Pro
+ro.product.brand=Xiaomi
+ro.product.manufacturer=Xiaomi
+ro.product.device=raphael
+
+# GLES 2.0 through glrenderd; apps that check this refuse to run below it.
+ro.opengles.version=131072
+
+# Eng bringup: root adb without auth.
+ro.adb.secure=0
+ro.secure=0

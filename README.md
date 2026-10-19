@@ -1,5 +1,7 @@
 # Retro Android Ports
 
+> 中文版：[README.zh-CN.md](README.zh-CN.md)
+
 Running ancient Android releases on hardware that postdates them. The
 project ports AOSP from **Donut 1.6 through Nougat 7.1** to many different
 devices that never officially ran them — and distils every hard-won lesson
@@ -118,8 +120,19 @@ Each release has its own end-to-end guide; the README stays short:
       — verify), forward-port maple TEST 36-37 (wifi supplicant services, adsp
       boot, dual-node lights, `service_locator.enable=0`), formalise GPU fixes
       into `patches/kitkat/`.
-- [ ] Other releases on newer hardware — Eclair/Froyo next (Gingerbread
-      through Nougat planned; Cupcake is impossible, source gone).
+- [x] Froyo 2.2 on `raphael` (Redmi K20 Pro): boots to Launcher, full-screen
+      1080x2340 (fbdev `yres` patched to `yres_virtual`), USB CDC-ACM serial
+      shell + `fbstreem`/`fbscreen` live mirror with touch control, global nav
+      bar (Back/Home/Recents) injected from StatusBarService, Contacts and
+      Browser installed. Phone-side touch is only partially reliable: the
+      goodix firmware intermittently reports `touch_num=0` mid-swipe and
+      Froyo's protocol-A parser treats that as a release. Full log in
+      `dumps/froyo-raphael/STATUS.md` (Oct 2026).
+- [ ] Gingerbread 2.3 on `raphael`: feasibility checked only — 64-bit Lucid
+      chroot via debootstrap and AOSP 2.3.7_r1 `repo init` both work; source
+      sync, build env and device tree not started. Paused 2026-10-18.
+- [ ] Other releases on newer hardware — Eclair next (Gingerbread through
+      Nougat planned; Cupcake is impossible, source gone).
 
 Device pages and their quirks logs carry the full detail and evidence:
 [cooper](docs/devices/cooper/README.md),

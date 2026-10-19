@@ -3,8 +3,9 @@
 # builds glrenderd's chroot: walks DT_NEEDED from the adreno blobs and glrenderd, pulling each lib
 # from vendor first, then lineage's system, then the apex libs. the gpu firmware goes in too.
 # usage: stage.py <sysroot from extract-lineage.sh> <build.sh out dir> <glr dir>
-# the glr dir gets hwchroot and root/, and is what full_maple.mk copies to /system/glr.
-# keep it at $AOSP_DIR/vendor/sony/maple-glr, sync-device-tree.sh's rsync --delete owns vendor/sony/maple
+# the glr dir gets hwchroot and root/, and is what full_<device>.mk copies to /system/glr.
+# keep it at $AOSP_DIR/vendor/xiaomi/raphael-glr, sync-device-tree.sh's rsync --delete owns
+# vendor/xiaomi/raphael
 import glob
 import os
 import shutil
@@ -26,11 +27,17 @@ SEARCH = [
     ("vendor/lib", sysroot + "/vendor/lib"),
     ("system/lib", sysroot + "/system/lib"),
     ("system/lib", sysroot + "/apexlib"),
+    # Lineage 23.2 keeps some 32-bit deps in the other partitions. flatten
+    # them into vendor/lib so hwchroot's LD_LIBRARY_PATH finds them.
+    ("vendor/lib", sysroot + "/system_ext/lib"),
+    ("vendor/lib", sysroot + "/product/lib"),
+    ("vendor/lib", sysroot + "/odm/lib"),
 ]
 # dlopened by name, never in DT_NEEDED. missing ones only cost a failed dlopen
 DLOPENED = ["eglSubDriverAndroid.so", "libq3dtools_adreno.so", "libadreno_app_profiles.so"]
-# the a540 microcode, gpmu and zap shader. kgsl loads them in glrenderd's context, so from the chroot
-FIRMWARE = ["a530_*", "a540_*"]
+# the Adreno 640 (SM8150) microcode, gpmu and zap shader. kgsl loads them
+# in glrenderd's context, so from the chroot
+FIRMWARE = ["a630_*", "a640_*"]
 
 
 def needed(path):
@@ -80,6 +87,9 @@ walk([n for n in DLOPENED if find(n)[1]])
 # the qcom one (gralloc.msm8998 on maple), never a stock gralloc.default the vendor might carry
 gralloc = sorted(g for g in glob.glob(sysroot + "/vendor/lib/hw/gralloc.*.so")
                  if not g.endswith("/gralloc.default.so"))
+qcom = [g for g in gralloc if os.path.basename(g) == "gralloc.qcom.so"]
+if qcom:
+    gralloc = qcom + [g for g in gralloc if g not in qcom]
 if not gralloc:
     sys.exit("no vendor/lib/hw/gralloc.*.so in the sysroot")
 copy(gralloc[0], "vendor/lib/hw/gralloc.default.so")
@@ -109,6 +119,6 @@ for rel, names in by_origin.items():
 print(f"gralloc: {os.path.basename(gralloc[0])}")
 print(f"firmware ({len(fw)}): {' '.join(sorted(os.path.basename(f) for f in fw))}")
 if not fw:
-    print("no a530/a540 firmware found, kgsl won't start the gpu", file=sys.stderr)
+    print("no a630/a640 firmware found, kgsl won't start the gpu", file=sys.stderr)
 if missing:
     sys.exit("missing: " + " ".join(sorted(missing)))

@@ -14,7 +14,7 @@ index 02914a0..4d69909 100644
  
  #include <EGL/egl.h>
  
-@@ -63,37 +66,38 @@ namespace android {
+@@ -63,37 +66,40 @@ namespace android {
  
  ANDROID_SINGLETON_STATIC_INSTANCE( Loader )
  

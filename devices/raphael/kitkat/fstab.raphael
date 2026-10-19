@@ -1,0 +1,8 @@
+# fstab.raphael — KitKat bringup (static nodes measured 2026-10-17)
+# /data is tmpfs and is mounted by init.raphael.rc, not by fs_mgr/vold.
+# /system borrows the 1 GB `cust` partition (sda30) for the first boot;
+# the retrofit super extents only reference phys system (sda?) and vendor,
+# so cust is free (verified with lpdump on the running device).
+/dev/block/sda30   /system   ext4   ro                                                         wait
+/dev/block/sda29   /cache    ext4   nosuid,nodev,noatime,nodiratime,nobarrier                  wait,check
+/dev/block/sda23   /persist  ext4   nosuid,nodev,barrier=1                                     wait,notrim
