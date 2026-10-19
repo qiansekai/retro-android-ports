@@ -5,7 +5,9 @@
 参考笔记：一份姊妹移植的 `CHARQUIRKS.md`（Android 4.2.2 跑在 Xperia 1 II、SD865、内核
 4.19；该文档为私有，不在本仓库）如何对映到 maple/KitKat。阅读于 2026-10-14。下文是：我们
 独立收敛到了什么（反过来印证了我们的路子）、哪些内容适用于我们当时的卡点、以及排给后续阶段
-的事项。当前状态见 [maple 怪癖](../devices/maple/quirks.zh-CN.md)；通用教训见
+的事项。它是一份带日期的快照：maple 此后已走过硬件 GL（先是 glrenderd，2026-10-18 起换成
+进程内的 [libhyb](software/libhyb.zh-CN.md)），所以下文中图形相关的条目都属历史。当前状态见
+[maple 怪癖](../devices/maple/quirks.zh-CN.md)；通用教训见
 [KitKat 移植笔记](porting-notes/kitkat.zh-CN.md)。返回 [advanced 索引](README.zh-CN.md)。
 
 ## 独立收敛到的结论（印证了我们的做法）
@@ -113,10 +115,14 @@
   把着。TEST 36 有完整清单。
 - TEST 37 的结论（maple 验证过，约束后续所有射频工作）：SKIP_QMI 无论有没有布置 BDF 都在
   启动时 panic（已回退）；QRTR 在内核里**根本不存在**（kallsyms 0 命中，只有老的
-  IPC_ROUTER），所以**没有** QRTR userspace（cnss-daemon、pd-mapper、rmt_storage、
-  tftp_server —— 64 位 chroot 的想法死得更透：连 `linker64` 都没有）。剩下的 wifi 路径
-  要么 modem 启动，要么内核回移 QRTR。音频剩下的路径同样必须避开 QRTR：
-  adsprpcd-over-SMD（`/dev/adsprpc-smd` 存在）或走 HAL 内 ACDB 经 `/dev/msm_audio_cal`
+  IPC_ROUTER）—— 所以任何直接链接 `libqrtr.so` 的东西都出局（`tftp_server`、`qrtr-ns`），
+  而内核回移 QRTR 仍然是一条 wifi 路径。但「**没有** QRTR userspace，无论是否 chroot」
+  这话说得太满（2026-10-18 复查）：厂商的 `libqmi_cci`/`libqmi_csi` 是双传输的，带一条
+  老的 IPC-router 退路（`pdserve` 的传输方式），而且 dump 里确实有一个真的 `linker64` ——
+  所以 cnss-daemon/pd-mapper/rmt_storage/sensors.qti 又重新是*候选*，待实机验证
+  （[taimen-kitkat-mapping.md](taimen-kitkat-mapping.zh-CN.md) §corrections；
+  怪癖页 TEST 36 的后续）。音频剩下的路径仍然可以完全避开 QMI：adsprpcd-over-SMD
+  （`/dev/adsprpc-smd` 存在）或走 HAL 内 ACDB 经 `/dev/msm_audio_cal`
   （`maple-fw/acdbdata` 已暂存）。
 - 音频：为这次移植写的 tinyalsa `audio.primary.maple`（TEST 36；扬声器 = `speaker` +
   深缓冲 MM1/pcm0，麦克风 = `handset-mic`/dmic1 + MM1/pcm0，DEC7 104，不用 acdb，探测前

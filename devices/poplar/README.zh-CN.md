@@ -31,7 +31,10 @@ maple 那套设备树所派生自的树，所以两者几乎一模一样是刻�
 - `displaytune.sh` —— 启动时一次性修正显示，取代旧的 keepawake
   变通做法（后者会让「熄屏」立刻又亮起）。
 - `glrenderd.sh`、`clearpad.idc`、`gpio-keys.kl`、`autowinch.sh`、`dump-boot-log.sh`、
-  overlay（模拟存储列表、导航栏、密度）。
+  overlay（模拟存储列表、导航栏、密度）。**glrenderd 的工具与补丁已于 2026-10-18
+  从仓库移除**（maple 转向了 libhyb，`docs/advanced/software/libhyb.md`）——
+  poplar 仍构建这套设计；被删掉的部分在 git 历史里，给 poplar 移植 libhyb
+  是已排队的活（`docs/devices/poplar/README.md`）。
 
 参考（不入 git，与 cooper blob 同一策略）：Sony
 `android_device_sony_poplar`（`ten` 分支）+ `yoshino-common`

@@ -21,9 +21,16 @@
   （按裸节点做 GPT 挂载并预建目录、setenforce 0、configfs
   USB gadget 兜底）、`init.maple.usb.rc` + `usbudc.sh`（DWC3 adb
   gadget 打通）、`ueventd.maple.rc`（节点属主）。
-- `glrenderd.sh`、`clearpad.idc`、`gpio-keys.kl`、overlay（模拟
-  存储列表、导航栏、密度）—— 哪些能用（启动、触摸、显示、adb、经 glrenderd 的
+- `clearpad.idc`、`gpio-keys.kl`、overlay（模拟
+  存储列表、导航栏、密度）—— 哪些能用（启动、触摸、显示、adb、经 libhyb 的
   硬件 GL）与哪些仍未解（音频/WiFi/RIL/相机）见 `docs/devices/maple/quirks.md`。
+- 图形栈（自 2026-10-18 起不再用 glrenderd）：`hyb/`（ELF 加载器 +
+  hooks，根为 `/system/a15`）、`egl/`（KitKat 命名的 EGL/GLES 兼容层 +
+  生成的桩）、`gralloc/`（基于 QTI gralloc1 的 KitKat gralloc/fb HAL，
+  即唯一的 fb0 翻转者）、`fbpresentd/`（64 位 MDSS 原子提交
+  投递器）、`rtc-restore/`（无 `/dev/alarm` 的时钟恢复）。暂存后的闭包
+  与构建出的投递器在本树之外（`vendor/sony/maple-hyb`、`vendor/sony/maple-bin`）；
+  工具在 `tools/libhyb/`，说明见 `docs/advanced/software/libhyb.md`。
 
 参考（不入 git，与 cooper blob 同一策略）：Sony
 `android_device_sony_maple`（`ten` 分支）+ `yoshino-common`

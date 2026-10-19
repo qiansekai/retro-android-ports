@@ -51,3 +51,37 @@ cooper 适配。
 4. 在 `vtouch.c` 里适配设备名（`cooper_vtouch`）、坐标退化值（面板分辨率）以及 type-A 与
    type-B 的处理 —— cooper 的注释标出了每一处适配。
 5. 为虚拟设备附一个 flag 集合合法的 `.kl`。
+
+## maple 适配（Sony Xperia XZ Premium）
+
+- 源码：`devices/maple/donut/vtouch/vtouch.c`（构建为 `maple_vtouch`，随 ramdisk 发布到
+  `/sbin/maple_vtouch`，由 `init.maple.rc` 里的
+  `service vtouch /sbin/maple_vtouch /dev/input/event7` 启动；该服务为 disabled，
+  在 `init.rc on boot` 中、`class_start default` 之前启动，好让虚拟节点在
+  system_server 的 EventHub 打开输入设备之前就顶替 event7）。
+- 本移植中的版本：v1.2.0-maple3。在 cooper 基础之上，maple 特有的行为有：
+  - MT 轴：clearpad 只声明 MT 轴（ABS_MT_POSITION_X/Y、TOOL_TYPE、TRACKING_ID、
+    PRESSURE），既没有 BTN_TOUCH/ABS_X/ABS_Y/ABS_MT_SLOT，又以 protocol type-A 上报；
+    分组在 TRACKING_ID >= 0 时提交（pressure/major 作为退化判据），抬笔是一个空分组。
+    源范围 0..2159 x 0..3839（为 1080x1920 面板的 2 倍）被照抄到虚拟设备上，由 Donut
+    的框架负责缩放。
+  - 面板需要用户态推一把：`clearpad_probe` 在 i2c probe 之后停在
+    `post_probe_start sysfs is required to start post probe` 不动；vtouch 在完成虚拟节点
+    顶替之后、进入中继循环之前，向
+    `/sys/devices/virtual/input/clearpad/post_probe_start` 写入 `1`（经由稳定的
+    input-class 符号链接，绝不用 `inputN`），并每秒重试 1 次、最多 60 s（该节点在内核时间
+    约 2.9 s 时出现，晚于 init 的 `on boot`）。
+  - 固件加载卡顿（v1.2.0-maple3）：post probe 的「ensure firmware」步骤会执行
+    `request_firmware(touch_module_id_0xd1.img)`；Donut 没有用户态固件 loader，于是每次
+    尝试都要耗满 firmware 类 60 s 的兜底超时，而驱动会重试 3 次 —— 触摸要到开机约 184 s
+    之后才活过来。vtouch 在 `start_post_probe()` 里第一件事就是把
+    `/sys/class/firmware/timeout` 设成 1，让重试快速失败，于是 post probe 约 4 s 就完成。
+    已验证该旋钮可写（回读为 1）；端到端计时只在下一次刷入 + 重启之后才验证（驱动拒绝
+    重跑：`already post probed, need reboot`）。
+  - 已验证的开机证据：dmesg `start post probewith post_probe_start sysfs` ->
+    `begin 'post probe' session` -> `ensure firmware` -> 设备 id `PLG1163-C1`
+    （family 0xd1、fw rev 0x03.02）-> `end post probe ... (rc=0)`；
+    `/dev/.vtouch.log` 显示 `touch panel post probe started (try 0)` +
+    `relaying on /dev/input/event7`；`/proc/bus/input/devices` 显示 `maple_vtouch`
+    （input8，Handlers event8->event7）携带 BTN_TOUCH + ABS_X/Y，而真正的 `clearpad`
+    （input7）被保留为 `/dev/input/vtouch_saved`。

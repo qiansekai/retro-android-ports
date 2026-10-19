@@ -17,7 +17,7 @@
 
 - 可跨同版本设备复用的通用经验：`docs/advanced/porting-notes/<release>.md`（Donut：`donut.md`，KitKat：`kitkat.md`）。新版本新开文件，并在 `docs/advanced/README.md` 注册。
 - 构建配方（源码获取、补丁顺序、打包、刷机），逐版本：`docs/advanced/build/<release>.md`。构建主机/容器配方变更：`docs/advanced/build-server.md` 或 `containers/<release>/`。
-- 项目自研软件/驱动说明：`docs/advanced/software/<tool>.md`（vtouch、glrenderd、mkbootimg-cooper）。新工具 ⇒ 新页面，从 `docs/advanced/README.md` 链接。
+- 项目自研软件/驱动说明：`docs/advanced/software/<tool>.md`（vtouch、libhyb、mkbootimg-cooper）。新工具 ⇒ 新页面，从 `docs/advanced/README.md` 链接。
 - 硬件特定事实、地址、分区布局、已验证修复、未解缺口：`docs/devices/<codename>/quirks.md`。
 - 行为/状态变化（新的启动状态、可用/不可用功能）：设备主页 `docs/devices/<codename>/README.md`、README 的 Ports 表、以及 `README.md` 的 Roadmap。
 - 补丁集变更：`patches/<release>/README.md`，与 `patches/<release>/` 下的 diff（+ `files/` overlay）放在一起。
@@ -39,3 +39,20 @@
 - 交叉链接保持相对路径（`[playbook](../porting-notes/donut.md)`、`[quirks](quirks.md)`）；新增文档、设备或版本时，保持 README 的 Ports 表、`docs/advanced/README.md` 索引以及各设备页的链接/状态一致。
 
 不做顺手重排/重格式化。保持你改的这份文件的行宽、要点风格与章节顺序。
+
+## 本 fork（Redmi K20 Pro / K40）
+
+见 `FORK.md`。以下规则让 `git merge upstream/main` 的代价保持很低：
+
+- 仅 raphael 的代码放在上游永不触碰的路径：`devices/raphael/`、
+  `docs/devices/raphael/`、`tools/raphael/`、`patches/kitkat/raphael/`。不要把
+  raphael 的改动塞回上游文件（`tools/libhyb/`、`patches/kitkat/*`、
+  `scripts/`），例外只有 `scripts/sync-device-tree.sh` 里的 `raphael)` case 行
+  和 `README.md` 顶部的 fork 说明。
+- raphael 的 GL 栈是 `tools/raphael/glrenderd/`（DRM/KMS 投递器，无 fbdev）。
+  上游已删除 `tools/glrenderd/`，改用 `tools/libhyb/`；不要把它
+  在上游路径里复活。
+- fork 专属文档（`FORK.md`、`docs/devices/raphael/**`）用中文写；
+  上游文档保持英文，并以 `*.zh-CN.md` 兄弟文件的形式翻译。
+- 不要提交 `dumps/`（已 gitignore）：它存放设备上的台账、boot 镜像与
+  串口日志。把持久事实提升进 `docs/devices/raphael/quirks.md`。

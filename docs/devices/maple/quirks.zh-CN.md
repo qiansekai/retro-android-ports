@@ -4,7 +4,7 @@
 
 移植到 maple 所需的一切：硬件快照、分区布局、
 kernel、阻塞清单，以及带已验证修复的完整
-TEST 1–37 打通日志。状态、版本与链接见
+TEST 1–49 打通日志。状态、版本与链接见
 [设备主页](README.zh-CN.md)；通用 KitKat 实战手册是
 [KitKat 移植笔记](../../advanced/porting-notes/kitkat.zh-CN.md)，另有
 [Donut 实战手册](../../advanced/porting-notes/donut.zh-CN.md) +
@@ -13,8 +13,10 @@ TEST 1–37 打通日志。状态、版本与链接见
 当前状态：**2026-10-15 已启动（BOOTED）** —— 4.4 kernel 上跑完整 KitKat 用户空间：
 `sys.boot_completed=1`、75 个 binder 服务、Launcher 在
 1080x1920 下合成、触摸可用、USB adb（`18d1:4ee7`）。**硬件加速
-GL/GLES 已于 2026-10-15 验证**（Adreno 540 经 glrenderd，GLES 3.2）。
-[`devices/maple/kitkat/`](../../../devices/maple/kitkat/) 下的设备树是带
+GL/GLES 已于 2026-10-15 验证**（Adreno 540 经 glrenderd，GLES 3.2）；**2026-10-18
+图形栈换成了 [libhyb](../../advanced/software/libhyb.zh-CN.md)**（驱动在进程内、
+`fbpresentd` 原子提交 —— 2026-10-18 构建、**2026-10-19 已刷入并在硬件上验证**，
+TEST 49）。[`devices/maple/kitkat/`](../../../devices/maple/kitkat/) 下的设备树是带
 注释、经启动验证的。剩余缺口（尚无
 蜂窝/音频/相机/WiFi —— 与 cooper 早期相同的已记录限制姿态）
 在文末跟踪；下面的阻塞 1–4 均已解决。
@@ -910,6 +912,11 @@ lights HAL + keyguard-scrim 修复已生效 —— systemui 扛住导航栏
         Lineage 两个都有，还带 rmt_storage 和 tftp_server）。这次探测没有产生
         新 tombstone（唯一一个新 tombstone 是 toolbox 里 `ls|grep` 的 SIGPIPE，
         已知噪声）。
+        **2026-10-19 已解决（TEST 50）：这不是保护域问题。**
+        ADSP 一直是在线的；它缺的是 ACDB 校准（内核的 cal 块来自
+        某个 userspace 加载器），而 HAL 只写了每个 buffer 的四分之一
+        （KitKat 的 tinyalsa `pcm_write` 收的是字节数）。不需要任何
+        `adsprpcd` —— 见本文件末尾的音频打通日志。
       - QRTR 结论（2026-10-16，定论）：`/proc/kallsyms` 里 `qrtr` 符号一个都没
         有（阳性对照通过：binder 409、msm_ipc_router 58、qmi_handle 12），
         `/proc/net` 里没有 qrtr，配置里只有遗留的 `CONFIG_IPC_ROUTER` + 内核内
@@ -923,6 +930,28 @@ lights HAL + keyguard-scrim 修复已生效 —— systemui 扛住导航栏
         存在；服务器上暂存了 7.9 MB 的 `maple-fw/acdbdata`），绝不能靠 QRTR 守
         护进程。同一个结论也否掉了 cnss-daemon chroot 的想法 —— wifi 剩下的路
         是 modem 启动或者内核 QRTR 后向移植（各自都是一条独立的线）。
+      - QRTR 后续（2026-10-18，从 dumps 做的静态复查）：
+        上面结论的内核那一半依然成立（没有 CONFIG_QRTR），
+        但「任何现代 QMI userspace …… chroot 也不行」这个说法
+        太强了，而「哪儿都没有 linker64」看的是错的那一份。
+        Lineage 22.1 自己的 vendor `libqmi_cci.so` 是双传输的 ——
+        `strings` 里既有 `qcci_ipc_router_ops` 也有 `qcci_qrtr_ops`，
+        还带一个运行时的 "QRTR NOT SUPPORTED/SUPPORTED" 探测 ——
+        而 `cnss-daemon` 链接了它，所以 libqmi_cci 客户端可以回退到
+        `pdserve` 已经在用的那套遗留 IPC-router 传输（TEST 40）。
+        而 Lineage 的 system 镜像里确实带着
+        `system/bin/bootstrap/linker64`（2,188,552 B 的 aarch64 ELF；
+        早先的探测看的是手机上挂载的活体视图，那里的 apex 是分开的）。
+        那六个守护进程（cnss-daemon、pd-mapper、rmt_storage、
+        tftp_server、irsc_util、sensors.qti）全是 aarch64 ELF，
+        `interpreter /system/bin/linker64`；传输划分：
+        cnss-daemon、pd-mapper、sensors.qti（`libqmi_cci`）和
+        rmt_storage（`libqmi_csi`，同样是双传输）属于候选，而
+        tftp_server 直接链接 `libqrtr.so`，出局。所以 cnss-daemon
+        chroot 这个想法重新回到了桌面上（WLFW 正是 wifi 缺的那一半）；
+        只有设备才能回答 libqmi_cci 的遗留路径是否能完成握手。
+        无论如何 `pdserve` 仍然取代 `pd-mapper`；逐子系统评估见
+        Taimen 对照页（§"The daemon chroot and the HAL bridges"）。
 
 ## 打通日志：service locator + pdserve（2026-10-17）
 
@@ -932,8 +961,8 @@ lights HAL + keyguard-scrim 修复已生效 —— systemui 扛住导航栏
   `msm8998-tasha-snd-card` —— **locator=1 没有带来音频回归**。locator 那 5 个
   卡住的 `pd_locator_work` kworker（audio_pdr、icnss、slimbus、ath10k、+）就是
   那道闸：内核在等一个 SERVREG_LOC（QMI 0x40、vers 1、instance 0x0101）服务器，
-  而这个移植上没有任何东西提供它（原厂 64 位的 `pd-mapper` 在 32 位 userspace
-  上跑不了，之前「没有 QRTR」的结论依然成立）。
+  而这个移植上没有任何东西提供它（原厂 64 位的 `pd-mapper` 需要 64 位 userspace；
+  见 2026-10-18 的 QRTR 后续 —— `pdserve` 仍是这个移植的方案）。
 - **pdserve**（`devices/maple/kitkat/pdserve/pdserve.c`，静态 musl armv7，现已
   作为 `pdserve` 进入 `PRODUCT_PACKAGES`）：一个 32 位的 SERVREG_LOC 提供者，
   走 `AF_MSM_IPC`（SOCK_DGRAM，family 27），绑定名字
@@ -1022,3 +1051,898 @@ lights HAL + keyguard-scrim 修复已生效 —— systemui 扛住导航栏
     即可（运行中的进程镜像是 `/glrenderd`）；替换 `/system/glr/root/glrenderd`
     会碰上 `Text file busy`，必须先 `stop glrenderd` —— stop → cp → chmod 755
     → `sync` → 重新挂载 ro → `start`。验证部署上去的身份要用 md5，不要用时间戳。
+
+## 打通日志：Donut USB adb（2026-10-18）
+
+- **TEST 42 —— FunctionFS 描述符数据必须用这个内核的古老 magic 值
+  （`1` / `2`），而不是现代的 `0x502` / `0x503`。**
+  - 症状：在 Donut 启动里，adbd 每秒重试一次 `open ep0` + `write
+    descriptors`，永不停歇（`/cache/adbd-ffs.log`：`write
+    descriptors len=62 FAILED ret=-1 errno=22`），内核从不打印
+    "read strings"，gadget 也从不绑定 —— 每约 6 s 一条 `configfs-gadget
+    a800000.dwc3: failed to start g1: -19`（在 strings 写入把
+    `desc_ready` 置上之前，`ffs_do_functionfs_bind` 一直返回
+    `-ENODEV`）。`kmsg` 里只有 init 那次 `functionfs: file system
+    registered`，此外什么都没有。
+  - 诊断：f_fs 的 QCOM IPC 日志
+    （`/sys/kernel/debug/ipc_logging/f_fs/log`，需要挂 debugfs）
+    四行就说清了全部：`ffs_ep0_write: enter:len 62 state 0` →
+    `__ffs_data_got_descs: enter: len 62` →
+    `__ffs_data_got_descs: exit: ret -22` → `ffs_ep0_write: exit:ret
+    …594`，中间**没有**任何 `ffs_do_descs` 条目。`ffs_do_descs` 之前只跑
+    两项检查：长度字段和 magic；长度是对上的（62 = 62），所以被拒的是
+    magic。
+  - 根因：我们的数据是按现代枚举生成的
+    （`#define FUNCTIONFS_DESCRIPTORS_MAGIC 0x502`），但 whatawurst 的
+    msm8998 4.4 树保留的是古老那套 ——
+    `include/uapi/linux/usb/functionfs.h`
+    （`android_kernel_sony_msm8998`，lineage-21）：
+    `FUNCTIONFS_DESCRIPTORS_MAGIC = 1`、`FUNCTIONFS_STRINGS_MAGIC = 2`、
+    `FUNCTIONFS_DESCRIPTORS_MAGIC_V2 = 3`。对 0x502 来说 `switch
+    (get_unaligned_le32(data))` 走 `default: goto error` —— 在任何
+    描述符日志之前就 `-EINVAL`。TWRP 的 adbd 在同一个内核上能跑，是因为
+    它带的就是这些值：它 `init_functionfs` 的 `.rodata` 模板是
+    `[magic 1, length 62, fs_count 3, hs_count 3]`（V1），先试
+    `[magic 3, length 0x90, flags 0xf, …]`，strings 用
+    `[magic 2, length 32, str_count 1, lang_count 1]`。
+  - 不重启的现场验证：在 TWRP 活着的那份旁边另开一个*测试* ffs 实例 ——
+    `mkdir /config/usb_gadget/g1/functions/ffs.test`（绝不要碰
+    `ffs.adb`）、`mkdir -p /dev/usb-ffs/test`、
+    `mount -t functionfs test /dev/usb-ffs/test`，然后
+    `exec 3<>/dev/usb-ffs/test/ep0`（**必须**是 `<>`；用 `O_TRUNC`
+    打开会失败）再 `cat blob >&3`。magic 1/2 → write 返回数据长度，日志里
+    是完整的 `ffs_do_descs` / `ffs_do_single_desc` /
+    `__ffs_data_do_entity` 解析，外加
+    `ffs_epfiles_create: … eps_count 2`，挂载点里出现 `ep1`/`ep2`。
+    magic 0x502/0x504 → 同样一行 `exit: ret -22`。
+    **读 ipc 日志会把日志消费掉** —— 只读一次，紧接在 write 之后，
+    否则证据就没了。
+  - 修复：`patches/donut/system-core-adbd-ffs.patch` 现在把
+    `FUNCTIONFS_DESCRIPTORS_MAGIC 1` / `FUNCTIONFS_STRINGS_MAGIC 2`
+    设好（并附了说明原因的注释）。2026-10-18 验证：刷入带修好的 adbd 的
+    boot.img（前缀 md5 匹配），`adb reboot` → 约 30 s 后主机枚举到
+    `mapledonut device` —— 一条真正的 adb 传输，而此前每次尝试只看到
+    TWRP 的 `recovery`。
+  - 后续（同一个 TEST，当晚稍后 —— 「手机消失了」的解释）：诊断构建的
+    `usbudc.sh` 是个解绑 + 重绑的循环（`echo "" > $UDC`；sleep 3；
+    `echo a800000.dwc3 > $UDC`），永远跑下去，而且只*记录*
+    `bind FAILED rc=0 err= eps=[]` —— rc 和空的 `eps` 都是读回竞态：
+    QCOM configfs 的 bind 是异步的（write 返回了，gadget 约 0.4 s 后才
+    起来），所以同一瞬间读 UDC 永远是空，而下一轮的解绑又把刚刚建立的
+    连接拆掉。主机的 `journalctl -k` 可以作证：`maple-donut` 每 6 s
+    连上 → 断开，42 个周期（11:52–11:57），设备号 119–160；手机侧 kmsg
+    每个周期都有对应的
+    `configfs-gadget gadget: high-speed config #1: b`，而
+    `failed to start g1: -19` **一次都没有**。240 s 的 autowinch 随后在
+    抖动中途重启回 recovery（`mdss_fb_release_all: … name=reboot`），
+    17 s 后主机又看到 TWRP。修法：`usbudc.sh` 改用 KitKat 移植验证过的
+    语义 —— 轮询 UDC，读到空才 bind，**绝不解绑**（adbd 掉 gadget 时仍
+    需要重绑：关掉 ffs 实例本身就会解绑）。设备上验证（2026-10-18）：
+    adb 枚举成 `mapledonut device` 并可用；抖动这件事的解释有主机日志 +
+    手机 kmsg 双重支撑。
+  - 后续 2（同一个 TEST）—— **某次启动完全没有 USB 的真正原因：Donut 的
+    shell 里没有 `[`。** 下一次启动用的 `usbudc.sh` 把 bind 卡在
+    `[ -z "$(cat $UDC)" ]` 上。Donut 的 `/system/bin/sh` 没有 `[`/`test`
+    —— 内建和二进制都没有 —— 所以每个 `[ ... ]` 都打印 `[: not found`、
+    返回非零，并悄悄走 **else** 分支。脚本的 `while [ $i -lt 600 ]` 一
+    次迭代都没跑：kmsg 里只有一行 usbudc，`usbudc: bind FAILED after 0
+    tries rc= err=` 出现在 2.840 s，整个启动里 `configfs-gadget` 相关行
+    为零，900 s 的 autowinch 把手机送回 TWRP（2026-10-18 12:39）。之前
+    对这次启动提出的「第一次 bind 撞上了 adbd 的 ep0 建立过程」这个理论
+    是错的 —— UDC 根本没被写过。发现方式是从 TWRP chroot 进 Donut 的
+    `/system`，用 Donut 自己的 shell 跑那个随镜像发出的脚本；能力清单与
+    通用教训在
+    [donut.zh-CN.md](../../advanced/porting-notes/donut.zh-CN.md)。这次
+    （错误）理论顺手产出的 ep1 闸门脚本和状态感知 autowinch 已经删掉 ——
+    见后续 3。
+  - 后续 3（同一个 TEST）—— **对 Donut shell 安全的脚本是可行的：gadget
+    绑定一次就一直在；之后 `adb shell` 还需要再修一处（也修掉了）。**
+    `usbudc.sh` 重写成只用退出状态判断：先等 12 s，然后每 3 s 执行一次
+    `cmp $UDC /cache/usbudc-unbound >/dev/null
+    2>&1 && echo a800000.dwc3 > $UDC`，每次尝试再向 `/dev/kmsg` 打一个
+    tick；参照文件里放的正是未绑定状态下 UDC 的内容。这份内容在设备上用
+    Donut 自己的 shell 对着一个活着的*未绑定* gadget 验证过
+    （`mkdir /config/usb_gadget/testg`，从不绑定，TWRP 的 `g1` 不碰）：
+    未绑定的 UDC = 1 个字节 `"\n"`（cmp rc 0 → 绑定），已绑定的 UDC =
+    `a800000.dwc3\n`（rc 1 → 跳过），而
+    `echo "" > /cache/usbudc-unbound` 能逐字节复现未绑定的内容。飞行
+    记录（2026-10-18 12:45 那次启动）：kmsg `usbudc: start` 2.897 s、
+    tick 1 14.899 s、`configfs-gadget gadget: high-speed config #1: b`
+    15.450 s、之后每 3 s 一个 tick —— 没有解绑、没有重绑、没有 `-19`；
+    主机 dmesg 只有一条
+    `new high-speed USB device … 18d1:4ee7 … maple-donut`（设备 37），
+    整个会话一直挂着，`adb devices` → `mapledonut device`。
+    - `adb pull`（sync 服务）立刻可用；`adb shell <cmd>` 接受了请求
+      （客户端侧记录：`shell:<cmd>` 之后马上 `OKAY`），然后永远挂住。
+      根因**不是**传输层：`service_to_fd` 的 `const char* args[2]` 是一个
+      局部数组，交给了服务线程（stack-use-after-return），于是 exec 出来的
+      子进程是光秃秃的 `/system/bin/sh`，**没有 `-c`**，就一直在等 stdin。
+      在没有 shell 的情况下，靠 `adb pull` 把 `/proc/<pid>/cmdline`
+      （15 字节 = 只有 `/system/bin/sh\0`）、`/proc/<pid>/wchan`
+      （`pipe_read`）和 `/proc/<pid>/syscall`（`3 …` = `read(0, …)`）
+      抓出来诊断的；pid 取自 bootlog 快照，当时正开着一条很长的
+      `adb shell sleep 60`。
+    - 修复（patches/donut/system-core.patch）：在 `service_to_fd` 里
+      `strdup()` 命令，在 `shell_service` 里拼 `-c <cmd>` 参数，子进程
+      退出时 `free()`；`reboot:` 里同样的潜在缺陷（参数指向已释放的
+      OPEN 包）用同样的方式修掉。验证 —— **2026-10-18 13:01 已验证**
+      （boot.img md5 `e6ee2096b22c4956dd152f38dc681d98`，dd 刷入，17 MB
+      前缀读回匹配）：`adb shell echo hello-donut` → `hello-donut`、
+      `adb shell id` → `uid=0(root) gid=0(root)`、stderr 会合并
+      （`echo out; echo err >&2` 两条都回来）、连续三次独立的 shell 会话
+      成功、`pull`/`push` 不变。同一次启动的 USB 故事很干净：
+      `usbudc: start` 2.837 s、tick 1 14.840 s、
+      `configfs-gadget gadget: high-speed config #1: b` 15.449 s、之后
+      每 3 s 一个 tick、零 `-19`、主机只枚举一次。shell 起来后从主机把
+      autowinch 杀掉（对每个 `/system/bin/sh` 的 pid `cat`
+      `/proc/<pid>/cmdline` 找到它），会话才能活过 15 分钟。
+
+## 打通日志：Donut system_server 崩溃 + 原子操作（2026-10-18）
+
+- **system_server 崩溃循环的根因 = 弱序多核 CPU 上没有屏障的 bionic
+  `__atomic_*`。** Donut 的
+  `bionic/libc/arch-arm/bionic/atomics_arm.S` 用 LDREX/STREX 重新实现了
+  `__atomic_cmpxchg/inc/dec/swap`，但**省掉了原 kuser 辅助函数提供的完整
+  内存屏障**。`cutils/atomic.h` 写明了契约（"all reads or writes issued before
+  android_atomic_* operations are guaranteed to complete before the atomic
+  operation takes place" = 全屏障）。在 4 核 Cortex-A73
+  （MSM8998，AArch32 兼容模式）上，这会破坏 bionic pthread mutex 和
+  libutils `futex_mutex` 的互斥（两者都调 `__atomic_*`），并间接影响
+  Dalvik 的加锁。症状：system_server + acore 崩溃循环
+  （3 分钟 10 个 tombstone，2026-10-18 16:49–16:52）、`abort ←
+  mspace_free ← dvmHeapSourceFree ← sweepBitmapCallback ← ... ←
+  gcForExternalAlloc`（堆损坏）以及 `free ←
+  SharedBuffer::release ← ~String16 ← Parcel::writeInterfaceToken`
+  （fault 0x0d）。对照实验：`msptest 3`（4 线程 × 100 万次迭代，
+  CAS 自旋锁 + 受保护的计数器 + malloc churn）在老 libc 上 = SIGSEGV
+  rc=139，修好后 PASS。修法：在全部四个 `__atomic_*` 函数里，每个
+  LDREX/STREX 前后都加 `dmb sy`（`.word 0xf57ff05f`）；同时把 libcutils 的
+  `android_atomic_swap`（仅剩的那一个 `swp`）也重写成 LDREX/STREX+dmb。
+  验证：`msptest 3` 和 `msptest 4`（原子一致性）在 TWRP 内核（4.4.263）和
+  Donut 内核（4.4.302）上、配修好的 libc
+  （md5 `2b6469277b6c4375849ea3c0d96f85d3`）和 libcutils（md5
+  `af710d64a95e0936f8841de6f37afe44`）都 PASS；基线（无屏障）的
+  `msptest 3` 在两个内核上都 = SIGSEGV。
+- **这个内核上有 kuser 辅助函数**（`CONFIG_KUSER_HELPERS=y`、
+  `CONFIG_COMPAT=y`）；kuser 页映射在 0xffff0000，版本字是
+  0x00000005。基于 kuser 的 `android_atomic_*`（libcutils，全屏障）一致性
+  全过。此前「kuser/页缺失」的假设是错的：真正作祟的是 `swp`，不是缺页。
+- **SWP 模拟是开的**（`CONFIG_SWP_EMULATION=y`）—— `swp` 被模拟执行
+  （慢，不致命），所以最初的崩溃是缺屏障导致的堆损坏，而不是指令故障。
+  没有模拟时 `swp` 在 ARMv8 上会陷入；LDREX 重写彻底避开了这个依赖。
+- **第二道拦路虎：`com.android.phone` 在锁屏上 OOM。** 堆还停在 Donut 的
+  默认值（16 MB 增长上限）时，锁屏图案壁纸的位图（28 KB 外部分配）把预算
+  撑爆了：`dalvikvm-heap: 28900-byte external allocation too large for
+  this process` → `LockPatternView.getBitmapFor` 里的
+  `OutOfMemoryError: bitmap size exceeds VM budget` → `UnlockScreen` 上的
+  `InflateException`（Binary XML line #60）→ WindowManagerPolicy 线程死亡
+  → `ViewRoot.setView` 处主线程 NPE（ViewRoot.java:428）→
+  `I/Process: Sending signal … SIG: 9` → zygote 退出 → init 重启 zygote →
+  崩溃循环。修法：在 `BoardConfig.mk` 里设
+  `USE_CUSTOM_RUNTIME_HEAP_MAX := 512m` —— Donut 的 dalvik 忽略
+  `dalvik.vm.heap*` 这些 prop（那是 Honeycomb 及以后才有的发明），只从
+  `-Xmx` 读最大堆、默认 16 m（除非定义了
+  `USE_CUSTOM_RUNTIME_HEAP_MAX`，`AndroidRuntime.cpp` 用的是 `-Xmx16m`）。
+  `system.prop` 里的 `dalvik.vm.heap*` 几行只为留档而保留。另外
+  `com.android.phone` 还有一次独立的崩溃：`PhoneApp.onCreate` →
+  `PhoneUtils.setAudioMode` → `AudioManager.setMode` 的 NPE（那一刻音频
+  服务还没注册）；已把 `AudioManager.setMode` 改成 null 安全。
+  `patches/donut/`（AudioManager null 安全）。
+- **新增了打通期插桩（TEMP，发布前移除）：**
+  - `/dev/log` 的 FIFO 垫片（`devices/maple/donut/logshim/logshim.c`，
+    静态二进制 `/sbin/logshim`）：在 `on init` 时（经 `exec
+    /sbin/logshim --init`）创建 `/dev/log/{main,radio,events}` 三个 FIFO，
+    并通过一个在 zygote 之前定义的非阻塞读服务把每一路镜像到
+    `/cache/logcat-{main,radio,events}.txt`。Donut 的 liblog 用 O_WRONLY
+    打开全部三个，任何一个失败就关掉日志，所以三个都必须有。记录是裸的
+    `[priority][tag\0][msg\0]`（没有 logger_entry 头）；main 那一路用
+    `tools/parse-logcat.py` 拆解。
+  - `system/core/init/init.c` 的 `zap_stdio()`：stderr 现在去
+    `/dev/kmsg` 而不是 `/dev/null`，于是崩溃输出（Java 未捕获异常栈、
+    linker 报错）会落到 `/cache/kmsg.txt`（klogd 已经在采集 + 轮转 +
+    fsync）。TEMP 打通期补丁。
+  - 两者在设备树里都标注为仅打通期使用；移植稳定后移除（AGENTS.md 的
+    补丁集纪律）。
+- **验证：** `msptest 4`（一致性）+ `msptest 3`（4 线程 × 100 万次迭代）
+  在 TWRP（4.4.263）和 Donut（4.4.302）两个内核上、配修好的 libc
+  （md5 `2b6469277b6c4375849ea3c0d96f85d3`）和 libcutils（md5
+  `af710d64a95e0936f8841de6f37afe44`）都 PASS；基线（无屏障）的
+  `msptest 3` 在两个内核上都 = SIGSEGV（rc=139）。
+
+## 打通日志：Donut 触摸面板 + keyguard（2026-10-18）
+
+- **TEST 43 —— clearpad 面板在 userspace 写入 `post_probe_start` 之前一直
+  沉默；`vtouch` 现在替它写（Donut 1.6 没有对应的 init 触发器）。**
+  - 症状：Donut 里触摸到处都不工作 —— 在 vtouch 的虚拟节点
+    （`/dev/input/event7`）和保留的真实节点（`/dev/input/vtouch_saved`）上
+    跑 `getevent`，手指在面板上拖动时两边都是零事件，锁屏毫无反应。框架侧
+    看起来没问题：EventHub/KeyInputQueue 接受了 `maple_vtouch`
+    （id 0x10000，ABS_X 0..2159 / ABS_Y 0..3839），所以故障在中继之下。
+  - 诊断：开机 dmesg 里有 `clearpad clearpad: (clearpad_probe:9356)
+    post_probe_start sysfs is required to start post probe` —— 驱动做完
+    i2c probe（约 1.8 s）后就停在那儿：面板上电但沉默（没有 IRQ、没有
+    事件）。这道闸门
+    `/sys/devices/virtual/input/clearpad/post_probe_start`（class 符号链接
+    `clearpad -> input7`）在第一次写入之前读到 `0`。
+  - 运行时证据：写 `1` 之后 dmesg 出现 `start post probewith
+    post_probe_start sysfs` → `begin 'post probe' session` → `ensure
+    firmware` → 设备 id `PLG1163-C1`（family 0xd1，fw rev 0x03.02）→
+    `end post probe ... (rc=0)`，同样是那一次手指拖动，此时在真实节点上
+    产生 5800 个裸的 protocol-A 事件、在虚拟节点上产生 1571 个翻译后的事件
+    （BTN_TOUCH + ABS_X/Y）—— 面板一旦醒过来，clearpad → vtouch → Donut
+    这条链就是好的。
+  - 这个写入在别处来自哪里：原厂 Sony init、KitKat 移植
+    （`devices/maple/kitkat/init.maple.rc`，`on post-fs-data`）和
+    TWRP（`/init.recovery.maple.rc`，`on post-fs`：`# start
+    clearpad_post_probe when filesystem is available for fwflash`）——
+    这就是为什么同一个内核上 recovery 里触摸是好的。Donut 1.6 的 init
+    根本没有 `post-fs`/`post-fs-data` 触发器
+    （`system/core/init/init.c` 只排队 `early-init`/`init`/`early-boot`/
+    `boot` + property 触发器），而 sysfs 节点要等内核 probe 时才出现
+    （这次启动是约 2.9 s），所以一次性的 `on boot` 写入会悄悄和它竞态。
+  - 修复：`devices/maple/donut/vtouch/vtouch.c` 的 `start_post_probe()` ——
+    在虚拟节点替换之后（system_server 那一次性的 input 扫描仍必须找到
+    `maple_vtouch`）、中继循环之前运行；打开
+    `/sys/devices/virtual/input/clearpad/post_probe_start`
+    （稳定的符号链接路径 —— 绝不要写死 `inputN`）并写 `1`，每秒重试
+    一次、最多 60 s。写入之前不可能有事件，所以这段等待不损失什么。
+  - 验证：运行时侧已完成（见上）。启动侧已验证（2026-10-19）—— 在
+    vtouch 写入版镜像的首次启动上：无需手动 poke，dmesg 就有 post probe，
+    且 `/dev/.vtouch.log` 有 `touch panel post probe started (try N)`。
+    在 vtouch 写入版构建上验证（2026-10-19）：dmesg 显示
+    clearpad_post_probe_start_store -> start post probe @ 3.043 -> ensure
+    firmware -> end post probe ... (rc=0)，全程没有手动 poke；
+    /dev/.vtouch.log 显示 `touch panel post probe started (try 0)` +
+    `relaying on /dev/input/event7`。同一次启动还暴露了固件回退造成的
+    卡顿（TEST 45）。
+- **TEST 44 —— 这个硬件上没有 MENU 键：相机快门全按现在发 MENU，
+  keyguard 敲一下就能解开。**
+  - 背景：Donut 时代还没有 action bar；非安全 keyguard 唯一的解锁输入是
+    `KEYCODE_MENU`（`LockScreen.onKeyDown` →
+    `mCallback.goToUnlockScreen()` → `keyguardDone(true)`），而且应用也
+    期待有 MENU 键。锁屏提示写的是 "Press Menu to unlock." —— 一个
+    并不存在的按钮。
+  - 硬件：不带设备参数跑 `getevent`（TWRP，同一个内核）可以看到
+    `gpio-keys`/event6 上两段式的快门发出干净的配对 —— 半按 `0001 0210`
+    （KEY_CAMERA_FOCUS 528）、全按 `0001 02fe`（KEY_CAMERA_SNAPSHOT 766）；
+    16 次按压对应 16 对按下/抬起。这是这个按键真能工作的第一份证据。
+  - 修法 1 —— 物理 MENU：`devices/maple/donut/gpio-keys.kl` 把
+    `key 766 MENU WAKE_DROPPED` 映射上（只映射全按 —— 全按同时也会发
+    半按的码，两个都映射成 MENU 的话每次按压会触发两次 MENU，把刚打开的
+    菜单又关掉）。半按（528）现在映射成 `BACK`（不带唤醒标志）用于应用内
+    导航（原来是 `FOCUS`）；代价是放弃了相机半按对焦（这个移植上相机 HAL
+    根本没起）。映射用的 token 是对着 Donut 的
+    `frameworks/base/include/ui/KeycodeLabels.h` 核过的（`MENU`=82、
+    `FOCUS`=80、`CAMERA`=27），因为 `KeyLayoutMap` 遇到未知 token 会整份
+    文件作废。
+  - 修法 2 —— 点按解锁：`LockScreen.onTouchEvent` 在 ACTION_DOWN 时调用
+    的正是同一个 `mCallback.goToUnlockScreen()`；安全 keyguard 仍然走它
+    自己的 `UnlockScreen`。keyguard 窗口是可触摸的（`KeyguardViewManager`：
+    TYPE_KEYGUARD 带 FLAG_FORCE_NOT_FULLSCREEN / 可选的 FLAG_ALT_FOCUSABLE_IM
+    —— 没有 FLAG_NOT_TOUCHABLE），且在紧急拨号按钮之外没有子视图消费触摸，
+    所以点按落到了 LockScreen 视图上。提示文案更新为 "Tap to unlock." /
+    "Tap to unlock or place emergency call."。
+  - SIM 缺失的 keyguard 陷阱：`stuckOnLockScreenBecauseSimMissing()`
+    （`mRequiresSim && !isDeviceProvisioned() && simState == ABSENT`）和
+    PUK_REQUIRED 会让 `goToUnlockScreen()` 变成静默空操作；这个移植的
+    `system.prop` 已经设了 `keyguard.no_require_sim=true`（所以
+    `mRequiresSim` 是 false），那个死胡同式的 SIM 锁屏永远不会出现
+    （测试机本来也没插 SIM）。
+  - 补丁：
+    `patches/donut/frameworks-policies-keyguard-touch-unlock.patch`
+    （从 `aosp-donut/frameworks/policies/base` 打）和
+    `patches/donut/frameworks-base-keyguard-touch-unlock.patch`（从
+    `aosp-donut/frameworks/base` 打）。
+  - 验证：见上面那组硬件扫描码。已验证（2026-10-19）：点按能解开 keyguard
+    （"Tap to unlock."）、相机全按（766）发出 MENU（launcher 菜单弹出）、
+    音量加减可用，且 launcher 保持在线（没有崩溃循环）。让 launcher 稳住
+    的正是 keychar 权限修法（0644）。
+- **adb 的设备序列号会告诉你现在在哪一次启动里。** Donut 启动广播的是
+  `mapledonut`；TWRP 广播的是手机自己的序列号 + `recovery`
+  （`CB512EGGHD  recovery`），而且**不**挂 `/system`
+  （`ls /system/bin` → `No such file or directory`，工具看起来就
+  "丢了"）。在调试一个消失的二进制之前先看 `adb devices`。
+
+## 打通日志：Donut 默认方向卡在横屏（2026-10-19）
+
+- **TEST 48 —— 翻盖的霍尔传感器（bu520x1nvx）报「盖已打开」，于是
+  Donut 强制横屏。**
+  - 症状：在竖屏面板上，主屏（以及每个应用）都按横屏（水平方向）渲染；
+    转手机没有反应（没有自动旋转 —— 传感器 HAL，`sensors.maple.so`，
+    不存在）。
+  - 诊断：`WindowManagerService` 每次启动都记 `Setting rotation to 1,
+    animFlags=1`。当 `mLidOpen` 为 true 时
+    `PhoneWindowManager.rotationForOrientationLw` 返回
+    `Surface.ROTATION_90`（1），而 `readLidState()` 设的是
+    `mLidOpen = (getSwitchState(0) == 0)`。没有装翻盖时 bu520x1nvx 霍尔
+    传感器（翻盖，SW_LID，input4）报 0，于是 Donut 把翻盖当成「滑出式键盘
+    被打开」，强制横屏。framebuffer 本身是 1080x1920（竖屏），触摸坐标
+    也已经与之匹配；错的只有旋转策略。
+  - 修复：`frameworks/policies/base/.../PhoneWindowManager.java`：
+    `KEYBOARD_ALWAYS_HIDDEN = false -> true`（maple 没有滑出式键盘），并
+    用 `!KEYBOARD_ALWAYS_HIDDEN` 给 lid-open 分支加闸，这样翻盖的「打开」
+    不再强制横屏。记为
+    `patches/donut/frameworks-policies-orientation.patch`（从
+    `aosp-donut/frameworks/policies/base` 打）。
+  - 验证：在方向修复版镜像上验证（2026-10-19）—— 主屏是正的（竖屏），并
+    保持竖屏（没有传感器 HAL 就不会自动旋转，而这个移植上它不存在）。
+
+## 打通日志：电源键处理（2026-10-19）
+
+- **TEST 47 —— 电源键由内核的 `powerkey_handle` 处理，不走 Android 的
+  input 系统，而且会被 USB 调试卡住。**
+  - 症状：手机接在 USB（adb）上时，按电源键看不到任何反应。dmesg 显示
+    内核*确实*有反应：启动时
+    `registering powerkey_handle handle for qpnp_pon`，每次按压记
+    `PM: suspend entry` -> `msm-dwc3 a800000.ssusb: Abort PM
+    suspend!! (USB is outside LPM)` -> `PM: suspend exit`。qpnp_pon 的
+    input 节点在能力位图里只声明了扫描码 19/20（KEY_R/KEY_T），并不向
+    userspace 投递任何 evdev 事件，所以 Android 的 input 系统永远看不到
+    `KEYCODE_POWER`。
+  - 诊断：PMIC 电源键在内核层由 `powerkey_handle` 处理，它会尝试整机
+    suspend。USB 调试开着时 USB 控制器不在低功耗模式，suspend 被中止，
+    屏幕就亮着 —— 这就是「什么都没发生」。拔掉 USB，suspend 成功，屏幕
+    锁定（走内核路径）。在这个移植上
+    `PowerManagerService.goToSleep()` 也关不了屏：休眠走的是移植过来的
+    lights HAL，不是 PowerManagerService，所以今天没有 Android 层的
+    锁屏路径。
+  - 试过/考虑过的修法：给 qpnp_pon 加 keylayout 条目没有用（没有 evdev
+    事件到达）；一个 userspace 守护进程 tail `/dev/kmsg` 里的
+    `PM: suspend entry` 然后调 `service call power 2 i32 <uptime>`
+    （goToSleep），在这个移植上关不掉屏；经
+    `/sys/class/backlight/panel0-backlight/brightness` 关背光只会把面板
+    变黑，不会锁定。真正的修法要么在 PowerManagerService 里接上
+    PM->lights，要么改内核让 qpnp_pon 经 evdev 报 `KEY_POWER`（这里的内核
+    源是预编译 blob，`work/maple-donut/kernel-Image.gz-dtb`）。
+  - 已记录的变通办法：拔掉 USB，电源键就能锁屏（内核路径）；开发期间用
+    `adb shell "service call power 2 i32 0"` 对显示是空操作，所以用
+    `adb shell "echo 0 > /sys/class/backlight/panel0-backlight/brightness"`
+    变黑、用 `echo 4095 > .../brightness` 恢复。不阻塞移植；记为未结项。
+
+## 打通日志：Donut 触摸固件回退 + 键盘字符映射（2026-10-19）
+
+- **TEST 45 —— clearpad 的 post probe 被 3×60 s 的固件加载回退卡在
+  后面。**
+  - 症状：每次启动后约 3 分钟里触摸到处都不工作，然后突然就好了（锁屏
+    开始响应点按、主屏可用）。重启后在头 3 分钟内测试能复现「触摸坏了」；
+    等过约 3 分钟又「修好了」。面板其实没坏 —— 是内核驱动在忙。
+  - 诊断：一次干净启动的 dmesg 时间线：`[3.043] start post probe` ->
+    `[3.306] ensure firmware` -> `[63.336] retry fwflash (0)` ->
+    `[123.390] retry fwflash (1)` -> `[183.443] retry fwflash (2)` ->
+    `[183.496] WA for Yoshino BU` -> `[183.759] end post probe @ 183.759
+    (rc=0)`。每个 `retry fwflash (N)` 前面都有一段 60 s 的
+    `request_firmware(touch_module_id_0xd1.img)` 等待，因 rc=-11（EAGAIN）
+    失败，原因是 Donut 没有 userspace 固件加载器（没有 ueventd 的固件
+    处理）；驱动重试 3 次，然后复位面板（SW reset）并完成 post probe。
+    触摸只在那之后才出事件。用户确认过：「主屏上触摸开始工作」发生在开机
+    超过约 3 分钟之后，「重启后触摸又不工作了」（重启后在那 3 分钟窗口内
+    测试），以及 uptime 328 s（> 184 s）时「现在有反应了」。
+  - 旋钮：firmware class 暴露了一个 class 属性
+    `/sys/class/firmware/timeout`（默认 60，单位秒）—— 也就是这段等待的
+    长度。写 `1` 之后每次重试约 1 s 就失败，整个 post probe 在踢一下之后
+    约 4 s 就结束，而不是约 184 s。已确认这个内核上可写（读回 1）。
+  - 修复：`devices/maple/donut/vtouch/vtouch.c` 的 `set_fw_timeout()` 在
+    `start_post_probe()` 里第一件事就往该属性写 `1`（在 post_probe_start
+    写入之前），这样驱动在它第一次请求之前就看到了新的超时值。版本号升到
+    v1.2.0-maple3。不需要在 init 里再加一道保险写入：这个移植上启动期间
+    没有别的驱动请求固件（dmesg 里其他 `fw request` 行数为零），而 vtouch
+    约在 3 s 跑，早于约 3.3 s 的第一次请求。
+  - 验证：旋钮写入已现场验证（读回 1）；post probe 完成后驱动拒绝再跑
+    （`clearpad_post_probe_start_store:
+    already post probed, need reboot`），所以端到端时间
+    （`end post probe @ ~7 s`）只能在下一次刷机 + 重启后验证。在 maple3
+    镜像上已验证（2026-10-19）：dmesg 显示 `end post probe
+    @ 6.529345232 (rc=0)`，重试发生在 4.10/5.16/6.21 s，vtouch 日志显示
+    `firmware load timeout set to 1s`，触摸在启动几秒内就在锁屏上响应
+    （用户确认「触摸一开始就能用」）。
+  - 通用教训：porting-notes/donut.md 的 "Firmware loads that wait for a
+    missing userspace helper"。
+
+- **TEST 46 —— 键盘字符映射文件以 0640 权限安装：Settings/Launcher
+  SIGSEGV。**
+  - 症状：打开 Settings（或任何会加载键盘字符映射的应用）时应用 SIGSEGV
+    崩溃。logcat 显示
+    `W/KeyCharacterMap: Can't open keycharmap file '/system/usr/keychars/
+    gpio-keys.kcm.bin'`、然后 `E/KeyCharacterMap: Can't find any keycharmaps
+    (also tried /system/usr/keychars/qwerty.kcm.bin)`、然后
+    `I/DEBUG: signal 11 (SIGSEGV), fault addr 00000004`，栈里
+    `#00 pc ... /system/lib/libui.so` -> `#02 ... /system/lib/
+    libandroid_runtime.so` -> `#03 ... /system/lib/libdvm.so`。tombstone
+    tombstone_01/02/04/05/09 是 com.android.settings；tombstone_00/03/06/07/
+    08 是 android.process.acore（也就是 Launcher，在 Donut 上它跑在这个
+    进程里）。打通期间早先看到的 launcher 崩溃循环（TEST 43/44 那段时间）
+    是同一个故障。
+  - 根因：`build/tools/kcm/kcm.cpp` 用
+    `open(..., O_RDWR|O_CREAT|O_TRUNC, 0660)` 创建 `.kcm.bin` 文件。构建的
+    umask（022）把它们留成 0640（`root:root`，其他用户不可读），于是应用
+    进程（uid app_*）打不开它们（`open()` 返回 EACCES -> `try_file()` 返回
+    NULL -> `KeyCharacterMap::load()` 返回 NULL -> 原生 JNI 路径解引用它
+    -> fault addr 4）。keylayout（`.kl`）和 idc 文件是 0644、加载正常，
+    所以相机→MENU 映射和触摸 idc 从来没受这件事影响。
+  - 修复：`build/tools/kcm/kcm.cpp` 里 0660 -> 0644 并加
+    `fchmod(out, 0644)`（只改 creat 的 mode 会被 umask 掩掉），记为
+    `patches/donut/build-kcm-file-mode.patch`（从 `aosp-donut/build` 打）；
+    另外在 `scripts/build-maple-donut-image.py` 里对 `*.kcm.bin` 加一道
+    `chmod 0644` 作为保险。可刷镜像之所以正确，靠的是打包脚本里这次
+    chmod，哪怕宿主机上的工具没打补丁。
+  - 验证：运行时侧已验证（debugfs 显示修复前镜像里的
+    `/usr/keychars/*.kcm.bin` 是 0640；logcat 显示 libui 里的崩溃回溯；
+    修复后新镜像里这些文件是 0644）。刷入侧已验证（2026-10-19）：设备上的
+    `/system/usr/keychars/*.kcm.bin` 是 0644，logcat 里
+    `Can't find any keycharmaps` 警告 0 条、`has died` 行 0 条，且
+    Settings 打开不再崩溃。
+
+## 打通日志：libhyb，进程内的 Adreno 驱动（2026-10-18）
+
+- **TEST 49（机主：「glrenderd 必须被淘汰」—— 移植
+  [DoomGuy41/Taimen-KitKat](https://github.com/DoomGuy41/Taimen-KitKat)；
+  2026-10-18）：** 图形栈换掉了。`libhyb`
+  （`devices/maple/kitkat/hyb/`）把 LineageOS 22.1（Android 15）的那套闭包
+  —— Adreno 540 驱动、QTI gralloc1、依赖 —— **直接加载进每个 KitKat
+  进程**；`egl/` 垫片保留 KitKat 的库名并转发（GLES 走生成的逐函数桩）；
+  `gralloc.maple` 在 QTI gralloc1 之上提供 gralloc 0.2 + fb HAL（真正的
+  ION buffer，带 QTI handle，可跨进程克隆）；`fbpresentd/`（64 位，NDK
+  构建）经 DMA0 上的 **MDSS 原子提交**呈现，拷贝 +
+  `FBIOPUT_VSCREENINFO` 作为回退。chroot、emugl 传输、
+  `tools/glrenderd/`、四个 `*glrenderd*` 补丁、
+  `patches/kitkat/files/` overlay、`BUILD_EMULATOR_OPENGL`、goldfish 的
+  guest 库以及绑在 `GLConsumer` 上的那套都**没了**；**上面 TEST 30–41
+  描述的是已被取代的 glrenderd 设计** —— 作为历史保留，其工具/补丁已删除。
+  完整说明见 [libhyb](../../advanced/software/libhyb.zh-CN.md)。
+  - **构建证据（服务器，2026-10-18）：** 闭包由 `tools/libhyb/stage.py`
+    从 Lineage 22.1 的 zip 里暂存 —— 19 个库
+    （`vendor/lib/egl`：驱动 + `eglSubDriverAndroid` + `libq3dtools`；
+    `vendor/lib`：`libc++`、`libgsl`、`libllvm-glnext`、
+    `libgrallocutils`、`libqdMetaData`、……；`system/lib`：`libsync`、
+    `libvndksupport`）+ a530/a540 固件，其中
+    `libc/libm/libdl/liblog/libcutils/libz/ld-android/libdl_android` 换成
+    **KitKat 自己的** bionic。`fbpresentd` 构建成 aarch64 静态二进制
+    （NDK r21e，4.0 MB）。镜像内容已验证：`/system/lib/libhyb.so`、
+    `/system/lib/hw/gralloc.maple.so`、`/system/lib/egl/{egl.cfg,
+    libEGL_adreno.so, libGLESv1_CM_adreno.so, libGLESv2_adreno.so,
+    libGLES_android.so}`、`/system/bin/{fbpresentd,hybtest,rtc-restore}`、
+    `/system/a15/{vendor,system}/...`。
+  - **KitKat 的 EGL 加载器不读 `egl.cfg`。** `Loader.cpp` 用 readdir 先扫
+    `/vendor/lib/egl` 再扫 `/system/lib/egl`，找 `libEGL_*.so` 并取
+    **第一个命中的**（唯一被显式跳过的是 `libGLES_android.so`）；在这个
+    发行版上 `egl.cfg` 运行期是死物。只要模拟库
+    （`libEGL_emulation.so`、……）还在，选到哪个驱动就靠 readdir 顺序的
+    运气 —— 所以模拟库不再构建，而 out 树里的陈旧副本必须删掉。
+    （对照服务器树里的 `Loader.cpp` 第 265–350 行验证过。）
+  - **从 `PRODUCT_*` 里删掉条目并不会把文件从 out 树里删掉。** 第一个
+    libhyb 镜像悄悄带上了整份 25 MB 的 `system/glr/` chroot、
+    `libEGL_emulation.so` 及其同伙、`libOpenglSystemCommon.so`、
+    `lib*_enc.so` 和 `/sbin/glrenderd.sh`：
+    `mkuserimg.sh` 打的是 `out/target/product/maple/system` 里当时有的
+    一切，而被去掉的 `PRODUCT_COPY_FILES`/`PRODUCT_PACKAGES` 条目会把
+    老文件（容器构建留下的、属主是 root）留在地上。修法：从 out 树里删掉
+    这些陈旧路径再重建镜像（服务器上是 `cleanup-rebuild.sh`）。所有「这个
+    文件为什么还在我的镜像里？」的问题到此为止。
+  - **`LOGI` 不是 KitKat 的宏。** `cutils/log.h` include 了
+    `log/log.h`，后者定义的是 `ALOGI`/`ALOGE` —— 第一次 `rtc-restore`
+    构建就在链接时失败，报 `undefined reference to 'LOGI'`（未展开的名字
+    变成了隐式函数调用）。
+  - **`__tls_get_addr`：「靠静态审阅关掉的风险」这个结论是错的。** 构建时
+    的遍历（用 `llvm-objdump` 过 `libc++`、`libutils`、
+    `libhidlbase`、`libgsl`、`libllvm-glnext`、`libgrallocutils`、
+    `libqdMetaData`）找到 0 个调用点，`hooks.c` 据此装了一个会 abort 的
+    绊线。但闭包*确实*需要 TLS：`libc++`、`libutils` 和 `libhidlbase` 带着
+    `R_ARM_TLS_DTPMOD32` 重定位（5 个，符号索引全是 0，`PT_TLS` 是纯
+    `.tbss`），而第一次 libhyb 启动就死在它们上面（zygote 在
+    `preloadOpenGL` 处被杀、surfaceflinger 在 `init()` 里 abort）。
+    重定位不是调用点 —— 回答「这东西需不需要 TLS」的是对闭包跑
+    `readelf -r`，不是反汇编里的符号搜索。加载器现在实现了
+    DTPMOD32/DTPOFF32，以及真正的 `__tls_get_addr`（修复与证据见本 TEST
+    末尾）。
+  - **32 位的 `MSMFB_ATOMIC_COMMIT` 会让内核崩溃**（来自 Taimen 移植；
+    maple 上 `verify-me`）：这就是 `fbpresentd` 是树外 64 位二进制的原因。
+    拷贝回退在 32 位下仍然可用（`FBIOPUT_VSCREENINFO` + yoffset，
+    TEST 30）。
+  - **hwui 现在打开了**（BoardConfig 里 `USE_OPENGL_RENDERER := true`，
+    与 Taimen 对齐）：glrenderd 时期的构建从没设过它，所以 `libhwui` 根本
+    没被编出来（UI 线程用软件绘制，只有 SurfaceFlinger 在 GPU 上合成）。
+    进程里有了真正的 ES2/ES3 驱动之后，加速 UI 路径正是这个移植的意义所在，
+    而 `frameworks-base-hwui-gles2-cap.patch` 让 hwui 留在它被测过的 ES2
+    行为上。首次刷入的检查：`dumpsys gfxinfo` 显示出真实的绘制耗时，且
+    `libhwui.so` 在 `/system/lib` 里。Taimen 还设了
+    `TARGET_DISABLE_TRIPLE_BUFFERING := true`（两个应用 buffer 而非三个）
+    —— 这里是候选调优项，没实测就不采用。
+  - **闭包里的 TLS 重定位让驱动加载不起来（2026-10-19 修复）。** 症状：
+    第一次 libhyb 启动时所有 GL 消费者同时死亡 —— zygote 启动几秒后被杀
+    （被杀前最后一条消息：`ZygoteInit.preloadOpenGL()`、
+    `ZygoteInit.java:237-245`），surfaceflinger 在
+    `SurfaceFlinger::init()+86` 里 abort。根因：Android 15 闭包里的
+    `libc++.so`、`libutils.so` 和 `libhidlbase.so` 带着
+    `R_ARM_TLS_DTPMOD32` 重定位（5 个，符号索引全为 0，槽位在 RW/RELRO
+    段，`PT_TLS` 是 filesz 为 0 的纯 `.tbss`），而加载器拒绝未知的重定位
+    类型，于是 `libEGL_adreno.so` 从来没起来。修复：在
+    [`hyb/linker.c`](../../../devices/maple/kitkat/hyb/linker.c) 里实现真正
+    的线程局部存储支持 —— 一张模块表（加载时 `hyb_tls_register`，
+    `map_file` 里抓 `DT_TLS`）、`DTPMOD32`/`DTPOFF32` 对着它解析，以及一个
+    懒分配的 `__tls_get_addr`（按线程缓存，每个模块一块
+    `posix_memalign`），从 `PT_TLS` 模板拷贝内容。实际用到的只有
+    `DTPMOD32`，17 处，符号全是 0 → 模块 = 自身。
+    `R_ARM_TLS_TPOFF32` 故意*不*实现，遇到就大声失败（同一次审阅也确认了
+    `__emutls_get_address` 不存在，见 TEST 49 的构建证据）。验证：`hybtest`
+    拿到 ES3 上下文（`EGL 1.5`、`Adreno (TM) 540`、
+    `OpenGL ES 3.2 V@331.0`）、绿色清屏的像素检查通过，并且清 2000 帧 +
+    `glFinish` 用 18.2 ms。进程内驱动加载耗时 9 ms。
+  - **GPU 和 ION 设备节点只有 root 能开，于是任何非 root 都渲染不了
+    （2026-10-19 修复）。** 症状：surfaceflinger abort，报
+    `LOG_ALWAYS_FATAL("no suitable EGLConfig found, giving up")`
+    （`SurfaceFlinger.cpp:407` → 第 321 行的 `selectConfigForAttribute`；
+    三次尝试返回的 config 都是 0），而同一个闭包在 `hybtest` 里渲染正常。
+    根因只有在 root 跑的 surfaceflinger 上才看得见（见下面的日志条目）：
+    `Adreno-GSL: <ioctl_kgsl_driver_entry:777>: open(/dev/kgsl-3d0)
+    failed: errno 13. Permission denied`、
+    `qdgralloc: Init: Failed to open ion device - Permission denied`，然后
+    `libEGL: eglInitialize(...) failed (EGL_BAD_ALLOC)` —— 一旦
+    `eglInitialize` 失败，KitKat 的 `eglChooseConfig` 就把每个 config 都
+    报成缺失的，那个致命断言真正想说的就是这个。内核把两个节点都建为
+    `root:root 0600`，而 `ueventd.maple.rc` 没有任何规则：glrenderd 那套
+    设计从不需要它们，它的渲染器在 chroot 里以 root 跑。修复：在
+    [`ueventd.maple.rc`](../../../devices/maple/kitkat/ueventd.maple.rc) 里
+    把 `/dev/kgsl-3d0` 和 `/dev/ion` 设为 0666（用 0666 而不是组规则：
+    调用方是 uid `system`、应用 uid `u0_aNN` 和 root，而这个 SELinux
+    宽容模式的移植上 DAC 就是全部）。在已经启动的设备上现场 `chmod 666`
+    就能确认修法、不用重刷；规则要重新刷 ramdisk 才生效。相关陷阱：
+    **init 里 surfaceflinger 服务带 `onrestart restart zygote`**（原厂
+    KitKat 就是这样），于是 SF 崩溃循环每隔几秒就杀掉 zygote，框架永远走
+    不到 `preloadClasses` —— 一个图形缺陷表现为三个互不相干的故障
+    （zygote 重启循环、SF abort、开不了机）。
+  - **服务打出的 `ALOG*` 输出无处可去，除非 `/dev/kmsg` 可写
+    （2026-10-19 定位）。** init 给服务的 stdout/stderr 是 `/dev/null`，
+    而这个内核没有 `/dev/log`，所以 liblog 的 kmsg 回退
+    （[`patches/kitkat/README.zh-CN.md`](../../../patches/kitkat/README.zh-CN.md)）
+    是唯一的出口 —— 但 uid `system` 去 `open("/dev/kmsg", O_WRONLY)` 会
+    得到 EACCES，liblog 随后把 `write_to_log` 指向
+    `__write_to_log_null`：消息被丢弃，且任何地方都不报错。只有 root 进程
+    （liblog 自己开 kmsg）和 zygote 的后代（继承了 zygote 已经打开的 fd）
+    才能进 dmesg，所以 app 和 system_server 的日志看得见，而
+    surfaceflinger、netd 和 media 是哑的。修复：在
+    [`init.rc`](../../../devices/maple/kitkat/init.rc) 里尽早 `chmod 0622
+    /dev/kmsg` —— 是 0622 不是 0666：非 root 服务可以写内核日志，读仍然
+    只有 root（`dmesg` 本来就需要 CAP_SYSLOG）。验证方式：以非 root uid 跑
+    `log -p i -t TESTTAG hi; dmesg | grep TESTTAG`，或者在已启动的设备上
+    手动跑一个服务（root 跑的副本会自己开 kmsg：`stop surfaceflinger;
+    surfaceflinger`）。
+  - **零拷贝呈现会让 fb0 变黑（陷阱，2026-10-19）。** 原子提交路径生效时
+    fb0 的内存从不被写过 —— DMA0 直接扫 ION buffer。对一个驱动得好好的
+    面板做 `dd if=/dev/graphics/fb0` 读回，结果全是零（两个 page 都是，
+    `pan 0,0`），所以 glrenderd 时代的那些 fb0 解码检查在这里说明不了
+    任何问题；要读回就改用下面 `fbpresentd` 的提交日志、
+    `dumpsys SurfaceFlinger`，或者强制走拷贝路径
+    （`persist.gralloc.fb_commit=0`）。
+  - **KitKat 的屏幕超时是 60 s**（`def_screen_off_timeout`），所以启动
+    一分钟后面板变黑是框架在正常工作，不是背光坏了：
+    `/sys/class/leds/lcd-backlight/brightness` 读到 0，
+    `settings put system screen_brightness 200`（幂等；lights HAL 会同时
+    写 lcd-backlight 和 wled）就能把它唤回来。
+  - **`fbpresentd` 现在经 `/dev/kmsg` 打日志**（init 给守护进程的是
+    /dev/null）：`ready`、`client connected/disconnected`、带
+    `strerror`/层错误码的提交失败、前三次提交，以及每 600 次提交一行带实测
+    速率的摘要 ——
+    `fbpresentd: commit #600 1080x1920: previous frame scanned out, 59.9 fps`。
+    release-fence 状态就是面板侧的证据：只有当 DMA0 已经把 buffer 读去
+    扫描输出之后，MDP 才会给上一次提交的 `release_fence` 发信号，所以
+    「scanned out」能把真正驱动的面板和 MDP 只是收下的提交区分开（100 ms
+    内始终不发的 fence 会被记成 `NOT scanned out in 100 ms`）。
+  - **设备上结果（2026-10-19，驱动进入启动路径后的首次启动）。**
+    `dmesg | grep -i hyb` 显示闭包按顺序加载（`libc++`、`libutils`、
+    `libhidlbase`、`libgsl`、`libllvm-glnext`、……、
+    `egl/libEGL_adreno.so`、`egl/libGLESv2_adreno.so`），然后是
+    `egl_adreno: Adreno 540 driver ready (gralloc import ok)`；
+    `gralloc.maple` 报 `fb0 1080x1920, line 4352 bytes, double buffer 1,
+    BGRA 0, atomic commit 1`；`dumpsys SurfaceFlinger` 报
+    `GLES: Qualcomm, Adreno (TM) 540, OpenGL ES 3.2 V@331.0`、
+    `EGL implementation: 1.5`、`EGL_NATIVE_VISUAL_ID: 1`、
+    `refresh-rate: 60.000002 fps`，内置显示器的图层在 1080x1920 上合成；
+    启动到 `sys.boot_completed=1`，`init.svc.surfaceflinger=running`、
+    `init.svc.bootanim=stopped`，全程没有任何手动步骤（上一个镜像需要现场
+    `chmod 666`，这一个是规则已经进了 ramdisk）。那次启动的节点读回：
+    `crw-rw-rw- root root /dev/kgsl-3d0`、`crw-rw-rw- root root
+    /dev/ion`、`crw--w--w- root root /dev/kmsg`。
+  - **冷启动的背光时间线（2026-10-19）。** 开机动画期间是全亮（`4095`，
+    内核/bootloader 留下的），随后框架接手，两个节点都读到 `1638`
+    （`mScreenBrightnessSetting=102` 缩放到 0-4095）—— TEST 41 的 lights
+    HAL 路径配 libhyb 仍然有效；一分钟后面板又黑了，因为
+    `def_screen_off_timeout` 是 60000（原厂值），且在
+    `stay_on_while_plugged_in` 命中时是调暗而不是关屏。
+  - **实测 fps 59.5-60.0，呈现器报 59.9。** 在一次滑动滚动中跑
+    `dumpsys SurfaceFlinger --latency
+    com.android.settings/com.android.settings.Settings`：127 帧 /
+    2.10-2.12 s = 59.5/60.0 fps；呈现器的第 600 次提交那行对同类突发报
+    `59.9 fps while active`（慢速滚动是 50.7）。**陷阱：** 那行日志的第一
+    版把整段时间窗（含空闲间隔）一起平均 —— 屏幕静止时 SF *什么都不* 提交
+    —— 于是 `--latency` 说 60.0 而它打印 `2.3 fps`；现在这个指标会跳过
+    超过 100 ms 的间隔，这才是「while active」的意思。
+  - **`persist.gralloc.fb_commit=0` 的 A/B 对照（2026-10-19）。** gralloc
+    记 `atomic commit 0`，拷贝 + `FBIOPUT_VSCREENINFO`-yoffset 路径接手，
+    fb0 读回现在*两个* page 里都有合成好的画面（
+    `dd if=/dev/graphics/fb0 bs=4194304 count=4`，2093/2108 个采样像素
+    非零）；按 4352 字节行（1088 px）stride 解码再裁到 1080x1920，得到
+    一帧干净的 UI —— 约 3.5 万种不同颜色，KitKat 壁纸和状态/导航栏都在位，
+    ![解码后的 fb0 帧](fb0-decode-copy-path-2026-10-19.png) —— TEST 30 的
+    fb0 解码检查在这条路径上仍然有效，拷贝回退本身就是这样验证的。之后
+    已恢复 `persist.gralloc.fb_commit=1` 并重刷：这个属性住在 /data 里，
+    所以能挺过一次 system 刷机 —— 如果 A/B 留下了 0，要手工复位，否则
+    设备会一直留在慢路径上。
+  - **面板持续在线（空闲功耗塌陷）。** 静止画面约 15 分钟后背光仍读到
+    `1638`，紧接着的滑动突发仍按 `59.9 fps while active` 呈现、每个
+    release fence 都发信号 —— DMA0 这条 pipe 没有塌。DT 属性裁剪
+    （`qcom,mdss-idle-power-collapse-enabled`，构建文档第 4 步）在刷入的
+    内核里（md5 `4a7b3eaf…`）。长时间空闲的目视确认仍然要机主来做；这里
+    给的是自动化证据。
+
+## 打通日志：音频 —— ACDB 校准 + 框架播放（2026-10-19）
+
+- **TEST 50（机主：音频要与
+  [DoomGuy41/Taimen-KitKat](https://github.com/DoomGuy41/Taimen-KitKat)
+  对齐；2026-10-19）：** **经框架播放能出声了。** 一个 `AudioTrack`
+  音调（`audiotrack_test`）经 AudioFlinger 和 `audio.primary.maple` 播
+  出去；同时跑的一路 DMIC 采集连续三秒都显示出这个 440 Hz 音调占
+  **150–3000 Hz 频段能量的约 99%**（音乐音量 11/15 时峰值约 180–240；安静
+  对照在 0.02–0.08），dmesg 里没有 `cal_block` 报错。在刷入的镜像上验证
+  （boot.img `0b0e750db3d6b6381d1e17f95e89af8c`、稀疏 system.img
+  `3b3d03bf03744ee8d468a0cd8039e7fd`；TWRP 读回的 md5 一致）。这条链按它
+  咬人的顺序排列：
+  - **没有校准就没有声音，哪怕 PCM 在跑。** q6asm/q6afe 在 stream/port
+    启动时于内核里查 ACDB 块（`send_afe_cal_type`、`q6asm_send_cal`）；
+    查不到就记 `cal_block not found!!` / `cal_block is NULL`，dsp 把 buffer
+    抽干得比实时还快，而扬声器上只有静音。这些块由某个 userspace 加载器经
+    `/dev/msm_audio_cal` 推下去，且绑定到那个进程的 fd，所以只要
+    mediaserver 活着，HAL 就必须一直持有这个加载器（常驻的
+    `acdbtest --v3 --hold` 辅助程序正是确立这一点的探针；发完就死的辅助
+    程序会把块丢掉）。
+  - **这个加载器是新版 Android 的库，所以它搭 libhyb 的车。**
+    `libacdbloader.so`（外加 `libaudcal`、`libacdbrtac`、`libacdb-fts`、
+    `libadiertac`、`libmiscta`、`libdiag`、vendor 的 `libtinyalsa`）由
+    `tools/libhyb/stage.py`（`ACDB` 这几条根路径）暂存，做法与 Adreno 驱动
+    完全一样；`audio_hw.c` 在设路由和 `pcm_open` 之前调
+    `acdb_loader_init_v2(card, NULL, 0)` +
+    `acdb_loader_send_audio_cal_v3(15, 1, 69936, 48000, 0)`
+    （`acdb_stream_cal()`；app type 69936 = qualcomm 的
+    `DEFAULT_APP_TYPE_RX_PATH`，acdb id 15 = 扬声器，来自 vendor 的
+    `audio_platform_info.xml`）。
+  - **`hw_platform` 决定 acdbdata 目录。** 加载器用
+    `/sys/devices/soc0/hw_platform` 拼出
+    `/vendor/etc/acdbdata/<hw_platform>/`，而 maple 上这个值读出来是
+    **MTP**，Lineage 的 yoshino 树却把数据放在 `Sony/` 下。按 `Sony/`
+    暂存的话加载器就没有 workspace 文件；`stage.py` 把
+    `vendor/etc/acdbdata/Sony` 拷成 `acdbdata/MTP`，`full_maple.mk` 把它
+    装到 `/system/vendor/etc/acdbdata/MTP`（8 个文件：7 个 `.acdb` +
+    `workspaceFile_Sony_yoshino.qwsp`）。vendor 树自己的 `MTP/` 目录里是
+    另一套（tavil 时代）校准 —— 对这个 tasha codec 而言正确的是 yoshino
+    （`Sony/`）那套，只是按 `MTP` 这个名字暂存。
+  - **`/dev/msm_audio_cal` 是 `root:root 0600`，而 mediaserver 的 uid 是
+    `media`。** 加载器的 open() 拿到 EACCES，故障在之后、以间接方式浮出
+    水面：`ADIE RTAC INIT` → `allocate_cal_block failed!` →
+    `Cannot allocate memory!` → init 拿到 `-ENOMEM`。在 `ueventd.maple.rc`
+    里修：`0660 media audio`（已验证：
+    `crw-rw---- media audio /dev/msm_audio_cal`）。原厂用的是同一条组规则。
+  - **mediaserver 在声卡 probe 之前就打开了 HAL。** `adev_open()` 在约
+    5 s 跑；tasha 声卡约 8 s 才注册（adsp 先启动），于是老代码永久缓存了
+    `card_name = "tavil"` 和 NULL mixer —— `speaker_path(NULL)` 是空操作，
+    对那时已存在的 card 0 调 `pcm_open` 仍然成功，结果是 PCM *在跑* 而
+    播放静音。`ensure_card()` 现在在第一个 stream 到来时重新探测并打开
+    mixer，`acdb_ensure()` 只在声卡起来之后才初始化加载器（更早初始化会在
+    ADIE RTAC 初始化里以 `-ENOMEM` 死掉）。
+  - **KitKat 的 tinyalsa `pcm_write()` / `pcm_read()` 收的是字节，不是
+    帧。** `external/tinyalsa/pcm.c` 自己把 count 除以帧大小，所以
+    `pcm_write(pcm, buffer, frames)` 只写了 AudioFlinger 每份 4096 字节里
+    的 1024 —— dsp 拿到的是被剁碎的信号，扬声器保持静音。动态调试直接把它
+    暴露了出来：HAL 这边是
+    `msm_pcm_playback_copy:fbytes =1024: xfer=1024 size=4096`，而
+    `tone_test` 是 `=2048: xfer=2048`。修法：两条路径
+    （`out_write` 和 `in_read`）都传 `bytes`，`tools/tone_test.c` 同理。
+  - **管用的调试方法。** 启动时 debugfs **没有**挂
+    （`/d` 是指向 `/sys/kernel/debug` 的悬空符号链接）；
+    `mount -t debugfs none /d` 之后就有 `dynamic_debug/control`，
+    `echo "file msm-pcm-q6-v2.c +p" > control`（还有 `q6asm.c`、
+    `q6adm.c`、`q6afe.c`、`msm-pcm-routing-v2.c`）能把每一步 buffer/cal
+    操作追进 dmesg。正是它证明了 HAL 在写（确实在写）、cal 也到了
+    （确实到了）—— 计数/单位那个 bug 藏在更底下。
+  - **手动验证工具。** `acdbtest`（`devices/maple/kitkat/hyb/`，libhyb；
+    `--init-only`、`--send ID TYPE`、`--v3 --hold 15 1`）在 HAL 接管校准
+    之前就证明了加载器、路径以及 fd 生命周期那条规则。`audiotrack_test`
+    （`devices/maple/kitkat/audio/`，在镜像里）驱动
+    AudioTrack → AudioFlinger → HAL，这是唯一会走到 HAL 自身 stream 处理
+    的路径；`tools/tone_test` 直接对 tinyalsa 说话，仍然是底层路由/采集
+    工具。
+  - **顺带的两处修复。** `adsp_boot` 加了 `oneshot`：不加的话 init 每约
+    5 s 就重启一次脚本，每次运行都重写
+    `/sys/kernel/boot_adsp/boot`（`adsp_loader_do: scheduling work to load
+    ADSP fw` 刷屏，而且重载会踩坏正在跑的 stream）；修好之后每次启动
+    `dmesg | grep -c "boot_adsp write returned"` = 1。另外
+    `full_maple.mk` 继承了 `frameworks/base/data/sounds/AllAudio.mk` ——
+    之前的镜像里根本没有 `/system/media/audio`，所以没有铃声也没有 UI 音效。
+  - **仍未收口。** 采集侧校准（DEC7 dmic 路由跑在未校准状态 —— TX 校准
+    加载器是接受的，但它会弄死 ADM，见 TEST 51；TX app type 69937 /
+    `Audio Stream Capture 0 App Type Cfg` 已接线，但被 `MAPLE_TX_CAL`
+    关着）；BT SCO 仍是已知死路（CHARQUIRKS）。UI 按键音之前是静音，原因
+    无关 —— 没有 `media_codecs.xml`，所以 SoundPool 解不了
+    `Effect_Tick.ogg` —— 已在 TEST 52 修复并验证（AOSP KitKat 里按硬件
+    音量键本来就不出声；出声的是触摸这条路径）。
+
+## 打通日志：音频 —— 框架采集、路由、TX 校准（2026-10-19）
+
+- **TEST 51（机主：音频要与
+  [DoomGuy41/Taimen-KitKat](https://github.com/DoomGuy41/Taimen-KitKat)
+  对齐；2026-10-19）：** **经框架采集能用了，耳机路由 + 它的校准可用，
+  而 TX（采集）校准是刻意关掉的。** `audiorecord_test`（新增：AudioRecord
+  → AudioFlinger → `audio.primary.maple`）录下 `audiotrack_test` 经同一个
+  HAL 播放的 440 Hz 音调：5.97 s 里主频 **440.00 Hz**，逐秒 `rms`
+  92–94（峰值 199–299），没有 `cal_block` 也没有 `adm_callback` 报错。
+  安静房间里单独采集读到峰值 85–174 / rms 20–32。在刷入的镜像上验证
+  （boot.img `0b0e750db3d6b6381d1e17f95e89af8c`、稀疏 system.img
+  `9d11eb2cb5a5036f6d74413e9b7c59d5`、TWRP 裸读回
+  `41f30fb19692367aab5f265ba00e3849`；TWRP 的 md5 一致。同样的检查在中间
+  那版 system `5ff353b7b6c5b3d5e2892cef76022553` 上也通过了）。
+  - **`ACDB_DEV_TYPE_IN` 是 2，不是 0。** 那个 0 不知道从哪儿来的 ——
+    `hardware/qcom/audio/hal/audio_hw.h`（这棵树里的 KitKat qcom HAL）
+    定义的是 `ACDB_DEV_TYPE_OUT 1` / `ACDB_DEV_TYPE_IN 2`。用 0 时
+    Android 15 的加载器会记 `ACDB -> Device is not RX or TX!acdb_id = 4`，
+    `acdb_loader_send_audio_cal_v3` 返回非零 —— 对这个全新的第一个 id 是
+    65、对其他是 66/67，而对一个已经用 dev_type 2 走过的 id 也会返回 66。
+    用 2 时同一个调用返回 0，日志显示
+    `send_audio_cal, acdb_id = 4, path = 1, app id = 0x11131, sample rate =
+    48000` → `GET_AFE_TOPOLOGY_ID for adcd_id 4, Topology Id 112fb` →
+    `send_hw_delay : acdb_id = 4 path = 1`。
+  - **……但那套 TX 校准会让每一次采集 prepare 都失败。** 下一次
+    `pcm_open(PCM_IN)` + prepare 就死了：当 HAL 自己发了这份 cal 时，放弃
+    的是 ADM（`adm_callback: cmd = 0x10326 returned error = 0x1`、
+    `msm_pcm_routing_reg_phy_stream: adm open failed copp_idx:-131`、
+    `msm_pcm_capture_prepare: stream reg failed ret:-22`、
+    `msm-pcm-dsp … ASoC: platform prepare error: -22`）；当只有
+    `acdbtest --scan` 发了它（没有采集 app type 配置，HAL 从没开过采集）
+    时，换 SLIM TX 后端失败（`msm-dai-q6-sb-0-tx: ASoC: cpu DAI prepare
+    error: -131`、`SLIMBUS_0_TX: ASoC: backend prepare failed -131`）。无论
+    哪条，`AudioRecord` 都拿不到数据（采集挂死），光跑 `tone_test cap`
+    也一样失败，所以问题在这些 cal 块、不在 HAL；而且它们**不会**被
+    `kill -9 mediaserver` 释放掉 —— 采集一直死到重启（验证过两次）。因此
+    `audio_hw.c` 里是 `MAPLE_TX_CAL 0`，注释里抄了这些日志：采集跑在未校准
+    状态（工作正常），RX 侧不受影响（acdb 15/10 都带 topology `112fc`）。
+    如果你要动它，在一台可牺牲的机器上复现的办法：开 TX cal 后跑一次
+    `audiorecord_test`，或者跑一次 `acdbtest --scan`，就足够毒掉那次启动的
+    采集。
+  - **加载器的 RX/TX 设备表是一份写死的清单。** 新的 `acdbtest --scan`
+    （一次加载器 init，然后一批 id，说明写在工具自己的注释里）在最终镜像
+    的一次全新启动上跑：RX 15（扬声器）、10（耳机）、799（扬声器 + 耳机）
+    → 全部返回 0；TX 4（听筒麦克风）、**8（耳麦麦克风）**、9、6、35、131、
+    143、152 → 用 `dev_type=2` 全部返回 0。`dev_type=0`（移植最初发的值）
+    被拒 —— 日志里是 `ACDB -> Device is not RX or TX!acdb_id = %d`，返回值
+    按 id 和顺序是 65/66/67。**scan 的那些 TX 发送会真的加载数据块，所以
+    它会毒掉那次启动剩下的采集**（就是上面那个 -131 的 SLIM TX 失败；播放
+    不受影响）—— 放到最后跑。另外**要在全新启动、框架的第一个 stream 之前
+    跑 scan**：一旦 mediaserver 初始化过加载器，第二次
+    `acdb_loader_init_v2` 就会死在
+    `cal_block_ion_alloc: audio ION import failed, rc = -22` →
+    `voice_alloc_cal … failed` → init `-12`（cal 块由第一个进程持有，而且
+    比它活得久）。
+  - **`routing=` 是有符号 int，而且策略层会在 startInput 时重发一次。**
+    `AudioPolicyManagerBase.cpp` 用的是
+    `param.addInt(String8(AudioParameter::keyRouting), (int)newDevice)`
+    （第 235/476/1022 行），所以输入设备会以负的十进制数到达
+    （0x80000004 → -2147483644），必须用 `str_parms_get_int` 解析再转回
+    `uint32_t`（用 `%u` 发会溢出成 `0x7fffffff` —— 这是亲身验证过的）。
+    HAL 现在在 stream 打开时按这个值选路由：扬声器（acdb 15）或耳机
+    （acdb 10）；内置麦克风（4）或耳麦麦克风（8）。RX 的 id 来自 vendor 的
+    `audio_platform_info.xml`/`platform.c` 表，TX 的 id 来自
+    `hardware/qcom/audio/hal/msm8974/platform.c` 里的
+    `acdb_device_table[]`（`IN_HANDSET_MIC 4`、`IN_HEADSET_MIC 8` ——
+    耳麦麦克风是 **8**，不是按 8974 时代那张表猜的 9）。
+  - **`route out 0x8 -> headset (acdb 10)` 已验证。**
+    `audiotrack_test 3 48000 0.5 8` 像策略层在插孔插入时那样，经
+    `AudioSystem::setParameters(0, …)` 发出 `routing=8`；HAL 记录了选耳机
+    的决定、应用 vendor 的 `headphones` 路径（RX INT1/RX2、
+    `CLSH_DSM_OUT`、RX1/RX2 音量 76）、发 cal 10（`Topology Id 112fc`）、
+    prepare 并播放 —— 没有 ADM 错误。能不能听到仍要机主插上耳机
+    （什么都没插 = 没有负载）。路由只在 HAL stream 打开时重新应用，所以
+    这个测试需要上一个输出先进入 standby（约 3 s）；紧接着开的第二条 track
+    会复用仍在跑的 stream、保留旧路由（已观察到）。
+  - **没有 `h2w` switch，所以插孔永远不会自己切路由。**
+    `/sys/class/switch/` 里只有 `hdmi hdmi_audio lid sim_detect wfd`。
+    KitKat 的 `WiredAccessoryManager` 盯的是
+    `/sys/class/switch/h2w/state`，所以没有任何东西会主动发
+    `routing=4/8`；应用也强制不了*输入*设备：策略层在 `startInput` 时会
+    重发它自己的输入路由（`dev routing=0x80000010 (in)` 紧接着
+    `in routing=0x80000004` → 内置麦克风）。`headset-mic` 路径
+    （`adc2` → DEC0 → SLIM TX0）写了、也编进了路由 switch，但**未实测**
+    —— 等内核暴露出插孔来源（wcd-mbhc 的 switch/extcon 桥）后 verify-me。
+  - **手动验证工具。** `audiorecord_test [seconds] [rate] [file] [routing]`
+    是 `audiotrack_test` 的采集姊妹工具（裸 S16_LE 单声道 + 逐秒
+    峰值/rms，routing 可选）；`audiotrack_test [seconds] [rate] [volume]
+    [routing]` 增加了 routing 参数；两者都在镜像里，并且都是在构造
+    track/record *之后*（否则 openOutput/openInput 会把它覆盖掉）、
+    start/write *之前*设置 routing（HAL 在第一个 buffer 时才懒打开 PCM）。
+    回环验证配方：
+    `adb shell 'audiotrack_test 8 48000 0.8 & sleep 1; audiorecord_test 6 48000 /data/local/tmp/loop.raw; wait'`
+    然后把文件 pull 回来，在主机上跑 `python3 scripts/analyze-rec.py loop.raw`
+    （裸 S16_LE 单声道，5.97 s → 上面那个 440.00 Hz / rms 92–94）。
+
+## 打通日志：媒体解码 —— 缺失的 media_codecs.xml（2026-10-19）
+
+- **TEST 52（机主：媒体要与原厂对齐 —— 原厂能播解码后的音频，这个移植
+  不能；2026-10-19）：** **裸 PCM 能播，可所有压缩格式都是静音：镜像里
+  没有 `/system/etc/media_codecs.xml`。** 这是在追 UI 点击音（点一下
+  导航栏）时发现的：点击路径本身是对的（`KeyButtonView` →
+  `AudioManager.playSoundEffect` → AudioService 的 SoundPool），但
+  SoundPool 报 `Unable to load sample: (null)` 和
+  `onLoadSoundEffects(), Error -22 while loading samples`；Music 的
+  AudioPreview 播同类 ogg 铃声时报
+  `MediaPlayer: error (1, -2147483648)` = `MEDIA_ERROR_UNKNOWN` +
+  `UNKNOWN_ERROR`（0x80000000，`utils/Errors.h`）。（AOSP KitKat 里按硬件
+  音量键本来就不出声 —— 之前那条「没观察到音量键点击音」是误导；要测的是
+  触摸这条路径。）
+  - **为什么裸的能播、压缩的不能。** 对 `audio/raw` 而言
+    `AwesomePlayer::initAudioDecoder` 绕过 OMX
+    （`mAudioSource = mAudioTrack`），所以 WAV（WAVExtractor → audio/raw）
+    正常播放 —— HAL 为它打开了（`route out 0x2 -> speaker (acdb 15)`、cal
+    已加载），这也是早先那些「扬声器播放可用」的检查能通过的原因。
+    ogg/mp3 需要 `OMXCodec::Create`；它对每个压缩 MIME 都返回 NULL。
+  - **根因。** 这个 4.4.4 树的 `OMXCodec::findMatchingCodecs` 去查
+    `MediaCodecList`，后者 `fopen` 的是
+    **`/etc/media_codecs.xml`**
+    （`frameworks/av/media/libstagefright/MediaCodecList.cpp`）。文件缺失
+    时它记 `MediaCodecList: unable to open media codecs configuration xml
+    file.`（ALOGW —— 唯一进到 dmesg 的那一行），而 `initCheck()` 停在
+    `NO_INIT`，于是 `getInstance()` 返回 NULL；`findMatchingCodecs` 让
+    vector 保持为空，`OMXCodec::Create` 返回 NULL、并以 **ALOGV** 级别记
+    `No matching codecs!` —— 这行被 `-DNDEBUG` 编译掉了，所以在默认日志
+    级别下这个失败是完全静默的。我们的镜像没有
+    `/system/etc/media_codecs.xml`：AOSP 只为 goldfish/sdk 带了这一份
+    （`device/generic/goldfish/camera/media_codecs.xml`，由 `sdk.mk` 拉进
+    来），而 `full_maple.mk` 错误地以为它「随原厂构建一起提供」。
+  - **两个错误码是同一个故障在两个层的表现。** Music 的 MediaPlayer 把
+    `initAudioDecoder` 的失败呈现为 `UNKNOWN_ERROR`（日志
+    `error (1, -2147483648)`）；SoundPool 的解码走
+    `MediaPlayerService::decode` → `AudioCache::notify` 记下
+    `MEDIA_ERROR`/`UNKNOWN_ERROR`，随后 `cache->wait()` 失败、decode 返回
+    `BAD_VALUE`（-22）—— 这就是 AudioService 报 `Error -22`、而同一段 dmesg
+    窗口里还有 `AudioCache: Error 1, -2147483648 occurred` 的原因。
+  - **修复。** 新增 `devices/maple/kitkat/media/media_codecs.xml`，列出
+    `SoftOMXPlugin` 提供、且这个镜像确实构建了的 `OMX.google.*` 组件
+    （17 个 `libstagefright_soft_*.so`；soft MPEG4 库同时提供 `mpeg4` 和
+    `h263`，`vpxdec` 提供 vp8+vp9；raw 解码器不列，因为 `MediaCodecList`
+    自己会加）。`full_maple.mk` 把它装到
+    `/system/etc/media_codecs.xml`（`/etc` 通常是指向 `/system/etc` 的
+    符号链接，已在设备上核对）。
+  - **在刷入的镜像上已验证（2026-10-19）。** boot.img
+    `0b0e750db3d6b6381d1e17f95e89af8c`、稀疏 system
+    `f8ab40bee62442f96b55f5cecb369061`、TWRP 裸读回
+    `ab879f3b082338fc838d1818055d3536`（TWRP 报 `ALL VERIFIED`）。
+    - **MP3：** Music 的 `AudioPreview` 播 `file:///sdcard/test440.mp3`
+      （ffmpeg 生成 440 Hz 正弦）→ HAL `route out 0x2 -> speaker (acdb
+      15)`、topology `112fc`、没有 `MediaPlayer: error`；对它做 DMIC 回环
+      （`audiorecord_test 5 48000`，用 `scripts/analyze-rec.py` 分析）在
+      0.00–2.25 s 读到 **440.00 Hz**（rms 48.9→18.9）。
+    - **OGG：** `/system/media/audio/ringtones` 里的 `ANDROMEDA.ogg` 走同
+      一个 AudioPreview → 同样的路由/cal，无报错。
+    - **UI 点击：** 在 Settings 里点一下导航栏，现在会打开 HAL 的 stream
+      （`route out 0x2 -> speaker (acdb 15)`），且不再记
+      `SoundPool: Unable to load sample` 或 `onLoadSoundEffects(),
+      Error -22`（这两条都是修复前的症状）。
+    - **视频（同一个修复）。** Gallery 的 `MovieActivity` 播
+      `file:///sdcard/testvid10.mp4`（ffmpeg `testsrc` 320×240、h264
+      Baseline + 880 Hz AAC）→ `OMXCodec: [OMX.google.h264.decoder] AVC
+      profile = 66 (Baseline), level = 12 / video dimensions are 320 x
+      240`、`SoftAAC2: Reconfiguring decoder: 0->44100 Hz`、`MediaPlayer:
+      info/warning (3, 0)`（= MEDIA_INFO_VIDEO_RENDERING_START）、HAL
+      `route out 0x2 -> speaker (acdb 15)` + cal 15/`112fc`。播放中途截的
+      图显示 testsrc 图案（彩条 + 圆）全屏缩放到 1080×1920 带黑边，而对
+      这条音轨做 DMIC 回环读到 **880.00 Hz**（rms 182）—— 也就是说软件
+      h264 解码器、GL 合成路径和音频轨三者协同工作正常。
+    - `ACDB_CMD_GET_AFE_COMMON_TABLE_SIZE` / `ACDB AFE returned = -19`
+      以及 `Failed to fetch the lookup information of the device
+      0000000F` 在这里是**良性**的：加载器每次发扬声器 cal 都会记这一条，
+      然后继续走 `AUDIO_SET_AFE_CAL` —— 那次成功的视频播放显示了同样的一对
+      日志（yoshino 的 MTP acdbdata 里没有 dev 15 的 AFE 公共表；真正
+      生效的 AFE cal 是 topology/`send_afe_cal` 那一份，声音以满电平回环
+      回来）。
+    - 第一次刷机在 TWRP 掉线约 10 分钟时中途失败；TWRP 回来时电池读到
+      100 %，所以那是 TWRP/USB 崩了，不是电量低。第二次刷入并校验干净。
+  - **对移植的含义。** 这个移植此前挂着的「扬声器音频」状态其实
+    只覆盖裸 PCM：铃声、通知/闹钟音、UI 点击音和音乐（KitKat 里全是
+    ogg/mp3）从来就播不了。同一个缺失文件还顺带废掉了*视频*解码（没有
+    h264/vpx 组件），所以这个移植也放不了视频；把 XML 装上之后，两者都已
+    验证（见上）。没有 OEM codec 清单的 KitKat 移植必须自带一份。

@@ -3,9 +3,11 @@
 > 中文译文。英文原文见 [poplar-kitkat-gpu-fixes.md](poplar-kitkat-gpu-fixes.md)。技术名词、代码、路径、命令与日志一律保留原文。
 
 yoshino MSM8998 上 `glrenderd` 工作的姊妹移植参考 —— 在 `poplar` 上开发，由 `maple` 采用。
-参见 [glrenderd](software/glrenderd.zh-CN.md)（权威记录）、
-[KitKat 移植笔记](porting-notes/kitkat.zh-CN.md)、
-[maple 怪癖](../devices/maple/quirks.zh-CN.md)、
+**对 maple 而言已属历史**：2026-10-18，glrenderd 的源码、补丁与工具已从本仓库移除
+（由 [libhyb](software/libhyb.zh-CN.md) 取代，见
+[移植笔记](porting-notes/kitkat.zh-CN.md#libhyb-lessons-maple-2026-10-18-built-on-device-verification-pending)）；
+poplar 仍从自己的设备树构建那套设计，而这些修复正是一次 poplar→libhyb 移植必须带着走
+（或有意识地丢掉）的东西。另见 [maple 怪癖](../devices/maple/quirks.zh-CN.md)、
 [poplar 怪癖](../devices/poplar/quirks.zh-CN.md)。
 
 在 yoshino MSM8998 设备上、KitKat 4.4.4 之下，是什么让硬件 GL 跑起来的 ——
@@ -44,12 +46,12 @@ guest libEGL/libGLESv1_CM/libGLESv2  ->  @glrenderd abstract socket
   让面板花屏。把已知可用的二进制留着。
 - `persist.glr.replytimeout`（默认 20 s）= guest 等多久之后判定守护进程已死。
 
-## 状态 —— 尚未进入 `patches/kitkat/`
+## 状态 —— glrenderd 时代；补丁集已于 2026-10-18 退役
 
-那里只有更早的脚手架（`device-generic-goldfish-glrenderd`、
-`frameworks-native-egl-glrenderd`、`sdk-glrenderd`、
-`system-core-glrenderd-fs-config`）。下面这些修复只存在于 poplar 的工作树里，所以在它们被
-正式化之前，**GPU 行为无法从仓库复现**：
+下面这些修复只存在于 poplar 的工作树里（那四个脚手架补丁已随 glrenderd 设计的其余部分
+一起从 `patches/kitkat/` 删除 —— 全部留在 git 历史里）。**按仓库现状，glrenderd 的 GPU
+行为无法复现**；poplar 的设备树加上 git 历史保留着旧设计，或者改移植 libhyb
+（[清单](software/libhyb.zh-CN.md#porting-it-to-another-device)），那这些修复就不再相干：
 
 | 修复 | 文件 |
 | --- | --- |
@@ -57,8 +59,8 @@ guest libEGL/libGLESv1_CM/libGLESv2  ->  @glrenderd abstract socket
 | 已死的流、`MSG_NOSIGNAL` | `device/generic/goldfish/opengl/shared/OpenglCodecCommon/SocketStream.cpp` |
 | 原地重连 | `device/generic/goldfish/opengl/system/OpenglSystemCommon/RenderdStream.cpp`（`.h`） |
 | 有界 `glGetError` | `frameworks/native/libs/gui/GLConsumer.cpp` |
-| 分发自解冻 | `frameworks/base/services/input/InputDispatcher.cpp`（`.h`） |
-| 套接字上限 | `tools/glrenderd/src/glrenderd.cpp`（`raise_socket_limits`） |
+| 分发自解冻 | `frameworks/base/services/input/InputDispatcher.cpp`（`.h`）—— **仍在仓库中**：`patches/kitkat/frameworks-base-input-dispatch-freeze-thaw.patch` |
+| 套接字上限 | `tools/glrenderd/src/glrenderd.cpp`（`raise_socket_limits`）—— 2026-10-18 删除，见 git 历史 |
 
-前两个扩展 `device-generic-goldfish-glrenderd.patch`；GLConsumer 与 InputDispatcher 两个是
-新的 `frameworks` 补丁。
+前两个扩展了 `device-generic-goldfish-glrenderd.patch`；GLConsumer 那个给套接字往返加了
+上界（没有套接字之后就不再相干）；InputDispatcher 那个修复与传输层无关，仍然在用。

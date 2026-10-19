@@ -9,7 +9,9 @@
 状态：**已启动，可日常使用（2026 年 10 月）** —— Sony 4.4 内核上的完整 KitKat
 用户空间：`sys.boot_completed=1`，1080x1920 的桌面 + 导航栏，触摸、USB adb，以及
 Adreno 540 上经 `glrenderd` 的硬件 GL
-（[poplar GPU 修复](../../advanced/poplar-kitkat-gpu-fixes.zh-CN.md)）。未解：没有
+（[poplar GPU 修复](../../advanced/poplar-kitkat-gpu-fixes.zh-CN.md)）—— 该设计 maple
+已于 2026-10-18 弃用并改用 [libhyb](../../advanced/software/libhyb.zh-CN.md)；poplar 那份
+工具/补丁副本在 git 历史里。未解：没有
 蜂窝/音频/相机/GPS/WiFi/BT，且渲染器在持续负载下仍会卡住。
 Donut/cooper 方法参考：[Donut 移植笔记](../../advanced/porting-notes/donut.zh-CN.md)；
 姊妹设备：[maple 怪癖](../maple/quirks.zh-CN.md)。

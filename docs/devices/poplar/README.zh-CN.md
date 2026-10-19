@@ -22,7 +22,7 @@ yoshino/MSM8998 平台，显示与 GPU 工作正源于 maple。
 | 桌面 / UI | 可用 |
 | 触摸 | 可用（Clearpad，全量程坐标，导航栏 + gpio 按键） |
 | 显示 | 可用，command-mode 面板，fb0 stride 4352 B（1088 px） |
-| GPU | **硬件 GL，经 [glrenderd](../../advanced/software/glrenderd.zh-CN.md)**（Adreno 540） |
+| GPU | **硬件 GL，经本树内置的 glrenderd 设计**（Adreno 540）。maple 于 2026-10-18 转向 [libhyb](../../advanced/software/libhyb.zh-CN.md) 时，glrenderd 的源码/补丁已从仓库移除；poplar 仍从自己的设备树构建旧设计 —— 被移除的部分在 git 历史里，给 poplar 移植 libhyb 是路线图项 |
 | USB | adb 可用（configfs gadget） |
 | 灯光 | 亮度 + 休眠经 `lights.poplar`（仅 `lcd-backlight` 节点 —— maple 此后已获得双节点；见怪癖） |
 | WiFi / 音频 | 尚未 —— 本设备树早于 maple TEST 36-37（没有 supplicant 服务，没有 adsp 启动）；需要前移 |
@@ -43,5 +43,7 @@ poplar 差异）。
 - [构建 KitKat](../../advanced/build/kitkat.zh-CN.md)。
 - [设备树](../../../devices/poplar/kitkat/)（`devices/poplar/kitkat/`）
   与 [AOSP 补丁](../../../patches/kitkat/README.zh-CN.md)（`patches/kitkat/`）。
-- 姊妹设备：[maple](../maple/README.zh-CN.md)。参考：[poplar GPU 修复](../../advanced/poplar-kitkat-gpu-fixes.zh-CN.md)，
-  工具：[glrenderd](../../advanced/software/glrenderd.zh-CN.md)。
+- 姊妹设备：[maple](../maple/README.zh-CN.md)。参考：[poplar GPU 修复](../../advanced/poplar-kitkat-gpu-fixes.zh-CN.md)
+  （本树 GPU 支持所源自的 glrenderd 时代捆绑；maple 此后已用
+  [libhyb](../../advanced/software/libhyb.zh-CN.md) 取代该设计，
+  那也正是我们欠 poplar 的路径）。

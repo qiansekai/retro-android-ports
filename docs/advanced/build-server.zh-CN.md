@@ -18,22 +18,35 @@
   https://android.googlesource.com/platform/manifest -b android-4.4.4_r2`，
   然后 `repo sync -c --no-tags -j6`）。浅克隆 + 仅当前版本 ≈ 14 GB。
   全历史 sync 会膨胀到 150 GB 以上 —— 绝不要裸跑 `repo sync`。
-- `~/retro-devices/kitkat/` —— `devices/maple/kitkat/` 的副本（scp 过去）。
-  用 `cp ~/retro-devices/kitkat/* ~/aosp-kitkat/vendor/sony/maple/`
-  暂存进树中（等同于仓库的 `sync-device-tree.sh`；该脚本假定树在本地）。
+  它不是顶层 git 仓库：每个 project 各有自己的仓库；按 project 回退/打补丁。
+- `~/aosp-kitkat/vendor/sony/maple/` —— 设备树，由工作站经 rsync 与本地
+  仓库保持同步：
+  `rsync -a --delete --exclude=/kernel <repo>/devices/maple/kitkat/ <user>@<host>:~/aosp-kitkat/vendor/sony/maple/`。
+  **`--exclude=/kernel` 里的前导斜杠不是可选项**：TWRP 导出的 kernel blob
+  就在该目录的最顶层，而 `--exclude kernel/`（不带斜杠）匹配不到这个文件 ——
+  第一次 sync 就把它删了（`~/maple-tree.bak-20261018` 正是为此存在）。
+- `~/aosp-kitkat/vendor/sony/maple-hyb/` + `maple-bin/` —— 暂存的图形闭包
+  与 NDK 构建的 `fbpresentd`，由
+  `tools/libhyb/{extract-lineage.sh,stage.py,build-native.sh}` 产出（副本放在
+  `~/retro-tools-libhyb/` 下，sysroot 在 `~/hyb-sysroot`，vendor 镜像挂载在
+  `~/vendorextract/mnt`）。刻意放在 rsync 路径之外。
 - `~/retro-containers/kitkat/Dockerfile` —— `containers/kitkat/Dockerfile` 的副本。
   改动后重建：
   `docker build -f ~/retro-containers/kitkat/Dockerfile -t retro-kitkat:4.4.4 ...`
 - `~/aosp-kitkat/vendor/sony/maple/kernel` —— TWRP 导出的 `Image.gz-dtb`
   （16.7 MB，不在 git 中）。若丢失，用
   `adb pull /dev/block/bootdevice/by-name/boot` + `abootimg -x` 重新导出。
+- `~/android-ndk-r21e/` —— `build-native.sh` 用的 NDK（KitKat 树只能产出
+  32 位二进制；`fbpresentd` 必须是 64 位）。
 - `~/aosp-kitkat/build-maple.sh`（`lunch full_maple-eng && make -j6`）、
-  `build-sys.sh`（`make systemimage`）、`build-boot.sh`（`make bootimage`）、
-  `run-*.sh` 包装脚本（`docker run --rm -v ~/aosp-kitkat:/srv/aosp-kitkat
+  `build-images.sh`（`make -j6 systemimage userdataimage cacheimage`）、
+  `cleanup-rebuild.sh`（从 `out/` 删掉 glrenderd 时代的遗留物并重建
+  boot + system 镜像）、`run-*.sh` 包装脚本
+  （`docker run --rm -v ~/aosp-kitkat:/srv/aosp-kitkat
   -v ~/ccache-kitkat:/srv/ccache-kitkat ...`，sudo 需从 stdin 读密码 ——
   见脚本文件）。
-- 日志：`~/build-maple.log`、`~/build-sys.log`、`~/build-boot.log`、
-  `~/repo-sync*.log`。
+- 日志：`~/build-maple.log`、`~/build-libhyb.log`、`~/build-sys.log`、
+  `~/build-boot.log`、`~/cleanup-rebuild.log`、`~/repo-sync*.log`。
 
 ## 后台启动（通道会挂起 —— 需单独验证）
 
@@ -59,6 +72,13 @@
 - KitKat 的 `make` 重新生成的 `system.img` 是 SPARSE —— `dd` 前
   务必 `simg2img`（用容器里的 `out/host/linux-x86/bin/simg2img`；
   它是 32 位，在 Ubuntu 26.04 宿主上跑不了）。
+- **删掉一个组件并不会把它从 out 树里删掉。**
+  `mkuserimg.sh` 会原封不动地打包 `out/target/product/maple/system`；
+  glrenderd 补丁被删除之后，下一个镜像仍然带着 25 MB 的
+  `/system/glr` chroot、模拟 GL 库与 `/sbin/glrenderd.sh`（属 root，
+  所以要 `sudo` 进容器或用包装脚本）。删掉这些陈旧路径或整个 `system/`
+  目录再重建镜像 —— `cleanup-rebuild.sh` 做的正是这件事，它是今后
+  任何组件退役的范本。
 - `make servicemanager systemimage` 这类目标能加速迭代；
   UAPI/bionic 改动后要跑完整 `make -j6`（约 1 小时，触及一切）。
 - `TARGET_NO_KERNEL` 尚未设置 —— 等服务器恢复访问后设置它
@@ -67,14 +87,28 @@
 ## 刷入流程（手机侧，从 Linux 工作站操作）
 
 手机处于 TWRP（`adb devices` → `recovery`）。镜像位于仓库 `dumps/`
-（gitignored）：
+（gitignored）。工作站没有 `simg2img`（AOSP 构建出来的那个也是 32 位），
+所以先在**服务器上**解稀疏：
+
+```sh
+# server, inside the container (or with its out/host tool):
+out/host/linux-x86/bin/simg2img out/target/product/maple/system.img /tmp/system.raw.img
+# workstation:
+rsync -P <user>@<host>:~/aosp-kitkat/out/target/product/maple/boot.img dumps/
+rsync -P <user>@<host>:/tmp/system.raw.img                            dumps/
+```
+
+然后逐个镜像：
 - `dd if=<raw-system> of=/dev/block/bootdevice/by-name/system bs=4M`
-  （5 GB 裸镜像，本地经 simg2img 转出；推到 `/data/media`，**不是**
+  （5 GB 裸镜像；推到 `/data/media`，**不是**
   `/sdcard`，后者拒绝创建文件；`adb shell` 的 stdin 管道会失败 —— 用文件推送）。
 - `dd if=<boot.img> of=/dev/block/bootdevice/by-name/boot bs=4M`
   + 每次重启前都做回读 md5 校验。
 - 回读状态：`/data/misc/watch*.txt`、`/data/misc/sm-debug.txt`、
   `/data/dalvik-cache` 数量、`/data/tombstones`、`/sys/fs/pstore/*`
   （若为空，在 TWRP 中挂载 pstore）、`/data/system/packages.xml`。
-- 启动 15 分钟后手机会自动回到 TWRP（autowinch 服务）；
-  等它落地后，`adb reboot` 开始下一轮。
+- Bootloop 守卫：autowinch 服务只在一次启动始终没有*活起来*时才把手机
+  送回 TWRP —— 熔断窗口内既无 `sys.boot_completed`，也没有在跑的 adbd
+  （默认 900 秒，`AUTOWINCH_FUSE` 可覆盖）。可调试的启动会让它自请下场，
+  且它在运行期间可经 adb 杀掉（`adb shell pkill -f autowinch.sh`）；
+  已死的启动仍会回到 TWRP，以便拉日志/重刷。`adb reboot` 开始下一轮。
