@@ -2,7 +2,7 @@
 # plus maple mounts/gadget via stock `import /init.${ro.hardware}.rc`
 # (ro.hardware=maple from androidboot.hardware). Single import only: a
 # duplicate `import /init.maple.rc` here used to spam kmsg with ignored
-# duplicate service definitions (bootlog/autowinch/sdcard/glrenderd).
+# duplicate service definitions (bootlog/autowinch/sdcard).
 # Shipped to ramdisk root (TARGET_PROVIDES_INIT_RC=true).
 
 # Copyright (C) 2012 The Android Open Source Project
@@ -34,6 +34,16 @@ on init
 sysclktz 0
 
 loglevel 3
+
+# Logging (2026-10-19): services started by init get /dev/null as stdout/stderr and
+# this kernel has no /dev/log, so liblog's /dev/kmsg fallback
+# (patches/kitkat/system-core-liblog-kmsg-fallback.patch) is the only sink a service
+# can open itself — but the kernel's node is root-only, so every uid != 0 service
+# (surfaceflinger, netd, media, ...) dropped its ALOG output silently. Only root
+# processes and zygote's children (they inherit zygote's already-open fd) reached
+# dmesg. 0622, not 0666: non-root may write the kernel log, only root may read it
+# (dmesg needs CAP_SYSLOG anyway). Verify: log -p i -t TESTTAG hi; dmesg | grep TESTTAG
+chmod 0622 /dev/kmsg
 
 # Backward compatibility
     symlink /system/etc /etc

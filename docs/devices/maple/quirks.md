@@ -1,7 +1,7 @@
 # maple quirks (Sony Xperia XZ Premium G8141/G8142)
 
 Everything needed to port to maple: hardware snapshot, flash layout,
-kernel, blocker list, and the full TEST 1–37 bringup log with verified
+kernel, blocker list, and the full TEST 1–49 bringup log with verified
 fixes. Status, releases and links live on the
 [device main page](README.md); the generic KitKat playbook is the
 [KitKat porting notes](../../advanced/porting-notes/kitkat.md), with the
@@ -11,7 +11,11 @@ fixes. Status, releases and links live on the
 Current state: **BOOTED 2026-10-15** — full KitKat userspace on the 4.4 kernel:
 `sys.boot_completed=1`, 75 binder services, Launcher compositing at
 1080x1920, working touch, USB adb (`18d1:4ee7`). **Hardware-accelerated
-GL/GLES verified 2026-10-15** (Adreno 540 via glrenderd, GLES 3.2). The
+GL/GLES verified 2026-10-15** (Adreno 540 via glrenderd, GLES 3.2); on
+**2026-10-18 the graphics stack was replaced by
+[libhyb](../../advanced/software/libhyb.md)** (driver in-process,
+`fbpresentd` atomic commit — built 2026-10-18, **flashed and verified on
+hardware 2026-10-19**, TEST 49). The
 tree in [`devices/maple/kitkat/`](../../../devices/maple/kitkat/) is a
 commented, boot-verified device tree. Remaining gaps (no
 cellular/audio/camera/WiFi yet — same documented-limitations posture as
@@ -974,6 +978,12 @@ Next actions (checkboxes for the log):
         adsprpcd on this port; Lineage ships both plus rmt_storage and
         tftp_server). No new tombstones from the probe (the one new
         tombstone is a toolbox `ls|grep` SIGPIPE, known noise).
+        **Resolved 2026-10-19 (TEST 50): not a protection domain.**
+        The ADSP was up all along; it was missing its ACDB calibration
+        (the kernel cal blocks come from a userspace loader) and the HAL
+        wrote a quarter of each buffer (KitKat tinyalsa `pcm_write` takes
+        bytes). No `adsprpcd` was needed — see the audio bringup log at
+        the end of this file.
       - QRTR verdict (2026-10-16, definitive): `/proc/kallsyms` holds
         ZERO `qrtr` symbols (positive controls pass: binder 409,
         msm_ipc_router 58, qmi_handle 12), `/proc/net` has no qrtr, and
@@ -992,6 +1002,30 @@ Next actions (checkboxes for the log):
         QRTR daemons. Same verdict kills the cnss-daemon chroot idea —
         wifi's remaining paths are modem boot or a kernel QRTR
         backport (both own workstreams).
+      - QRTR follow-up (2026-10-18, static re-check from the dumps):
+        the kernel half of the verdict above stands (no CONFIG_QRTR),
+        but "no modern QMI userspace ... chroot or not" was too
+        strong, and "no linker64 anywhere" looked at the wrong copy.
+        Lineage 22.1's own vendor `libqmi_cci.so` is dual-transport —
+        `strings` shows `qcci_ipc_router_ops` AND `qcci_qrtr_ops`
+        with a runtime "QRTR NOT SUPPORTED/SUPPORTED" probe — and
+        `cnss-daemon` links it, so libqmi_cci clients can fall back to
+        the legacy IPC-router transport `pdserve` already uses (TEST
+        40). And the Lineage system image carries a real
+        `system/bin/bootstrap/linker64` (2,188,552 B aarch64 ELF; the
+        earlier probe saw the live phone mount, where apexes are
+        separate). The six daemons (cnss-daemon, pd-mapper,
+        rmt_storage, tftp_server, irsc_util, sensors.qti) are all
+        aarch64 ELF with `interpreter /system/bin/linker64`; transport
+        split: cnss-daemon, pd-mapper, sensors.qti (`libqmi_cci`) and
+        rmt_storage (`libqmi_csi`, also dual) are candidates, while
+        tftp_server links `libqrtr.so` directly and stays out. So the
+        cnss-daemon chroot idea is back on the table (WLFW is the
+        missing half of wifi); only the device can show whether the
+        libqmi_cci legacy path completes the handshake. `pdserve` still
+        supersedes `pd-mapper` regardless; per-subsystem assessment in
+        the Taimen mapping page (§"The daemon chroot and the HAL
+        bridges").
 
 ## Bringup log: service locator + pdserve (2026-10-17)
 
@@ -1002,8 +1036,8 @@ Next actions (checkboxes for the log):
   The locator's 5 stuck `pd_locator_work` kworkers (audio_pdr, icnss,
   slimbus, ath10k, +) were the gate: the kernel waited for a SERVREG_LOC
   (QMI 0x40, vers 1, instance 0x0101) server that nothing on this port
-  provided (the stock 64-bit `pd-mapper` cannot run on a 32-bit
-  userspace, and the earlier "no QRTR" verdict stands).
+  provided (the stock 64-bit `pd-mapper` needs a 64-bit userspace; see
+  the 2026-10-18 QRTR follow-up — `pdserve` stays the port's solution).
 - **pdserve** (`devices/maple/kitkat/pdserve/pdserve.c`, static musl
   armv7, now shipped as `pdserve` in `PRODUCT_PACKAGES`): a 32-bit
   SERVREG_LOC provider over `AF_MSM_IPC` (SOCK_DGRAM, family 27), binding
@@ -1113,3 +1147,999 @@ Next actions (checkboxes for the log):
     `/system/glr/root/glrenderd` hits `Text file busy` until
     `stop glrenderd` — stop → cp → chmod 755 → `sync` → remount ro →
     `start`. Verify deployed identity by md5, not timestamps.
+
+## Bringup log: Donut USB adb (2026-10-18)
+
+- **TEST 42 — the FunctionFS descriptor blob must use this kernel's
+  ancient magic values (`1` / `2`), not the modern `0x502` / `0x503`.**
+  - Symptom: on a Donut boot, adbd retries `open ep0` + `write
+    descriptors` once a second forever (`/cache/adbd-ffs.log`: `write
+    descriptors len=62 FAILED ret=-1 errno=22`), the kernel never logs
+    "read strings", and the gadget never binds — `configfs-gadget
+    a800000.dwc3: failed to start g1: -19` every ~6 s
+    (`ffs_do_functionfs_bind` returns `-ENODEV` until the strings write
+    has set `desc_ready`). `kmsg` shows `functionfs: file system
+    registered` from init and nothing more.
+  - Diagnosis: the f_fs QCOM IPC log
+    (`/sys/kernel/debug/ipc_logging/f_fs/log`, needs debugfs mounted)
+    told the whole story in four lines: `ffs_ep0_write: enter:len 62
+    state 0` → `__ffs_data_got_descs: enter: len 62` →
+    `__ffs_data_got_descs: exit: ret -22` → `ffs_ep0_write: exit:ret
+    …594`, with **no `ffs_do_descs` entry in between**. Only two checks
+    run before `ffs_do_descs`: the length field and the magic; the
+    length matched (62 = 62), so the magic was rejected.
+  - Root cause: our blob was built from the modern enum
+    (`#define FUNCTIONFS_DESCRIPTORS_MAGIC 0x502`), but whatawurst's
+    msm8998 4.4 tree kept the ancient one —
+    `include/uapi/linux/usb/functionfs.h`
+    (`android_kernel_sony_msm8998`, lineage-21):
+    `FUNCTIONFS_DESCRIPTORS_MAGIC = 1`, `FUNCTIONFS_STRINGS_MAGIC = 2`,
+    `FUNCTIONFS_DESCRIPTORS_MAGIC_V2 = 3`. `switch
+    (get_unaligned_le32(data))` hits `default: goto error` for 0x502 —
+    `-EINVAL` before any descriptor logging. TWRP's adbd works on the
+    same kernel because it ships those values: its `init_functionfs`
+    `.rodata` template is `[magic 1, length 62, fs_count 3, hs_count
+    3]` (V1), with `[magic 3, length 0x90, flags 0xf, …]` tried first
+    and `[magic 2, length 32, str_count 1, lang_count 1]` for the
+    strings.
+  - Live proof without a reboot: a *test* ffs instance beside TWRP's
+    live one — `mkdir /config/usb_gadget/g1/functions/ffs.test`
+    (never touch `ffs.adb`), `mkdir -p /dev/usb-ffs/test`,
+    `mount -t functionfs test /dev/usb-ffs/test`, then
+    `exec 3<>/dev/usb-ffs/test/ep0` (**must** be `<>`; an `O_TRUNC`
+    open fails) and `cat blob >&3`. Magic 1/2 → write returns the blob
+    length, the log shows the full `ffs_do_descs` /
+    `ffs_do_single_desc` / `__ffs_data_do_entity` parse plus
+    `ffs_epfiles_create: … eps_count 2`, and `ep1`/`ep2` appear in the
+    mount. Magic 0x502/0x504 → the same one-line `exit: ret -22`.
+    **Reading the ipc log consumes it** — read it exactly once,
+    immediately after the write, or the evidence is gone.
+  - Fix: `patches/donut/system-core-adbd-ffs.patch` now sets
+    `FUNCTIONFS_DESCRIPTORS_MAGIC 1` / `FUNCTIONFS_STRINGS_MAGIC 2`
+    (with a comment saying why). Verified 2026-10-18: boot.img with the
+    fixed adbd flashed (prefix md5 match), `adb reboot` → host
+    enumerates `mapledonut device` ~30 s later — a real adb transport,
+    where every previous attempt showed only TWRP's `recovery`.
+  - Follow-up (same TEST, later in the night — the "phone vanished"
+    explanation): the diagnostic build's `usbudc.sh` was an unbind +
+    rebind loop (`echo "" > $UDC`; sleep 3; `echo a800000.dwc3 > $UDC`)
+    that ran forever and only *logged* `bind FAILED rc=0 err= eps=[]` —
+    both the rc and the empty `eps` were readback races: the QCOM
+    configfs bind is asynchronous (the write returns, the gadget starts
+    ~0.4 s later), so reading the UDC in the same instant always showed
+    empty, and the next cycle's unbind then tore down the connection it
+    had just made. Host `journalctl -k` proves it: `maple-donut` connect
+    → disconnect every 6 s, 42 cycles (11:52–11:57), device numbers
+    119–160; the phone's kmsg has the matching
+    `configfs-gadget gadget: high-speed config #1: b` every cycle and
+    **zero** `failed to start g1: -19`. The 240 s autowinch then rebooted
+    to recovery mid-flap (`mdss_fb_release_all: … name=reboot`) and the
+    host saw TWRP again 17 s later. Fix: `usbudc.sh` now uses the KitKat
+    port's proven semantics — poll the UDC, bind when it reads empty,
+    **never unbind** (rebinding when adbd drops the gadget is still
+    needed: closing the ffs instance unbinds it). Verified on-device
+    (2026-10-18): adb enumerated as `mapledonut device` and worked; the
+    flap explanation is host-log + phone-kmsg backed.
+  - Follow-up 2 (same TEST) — **the real reason a boot came up with no
+    USB: Donut's shell has no `[`.** The next boot used a `usbudc.sh`
+    whose bind was gated on `[ -z "$(cat $UDC)" ]`. Donut's
+    `/system/bin/sh` has no `[`/`test` — builtin or binary — so every
+    `[ ... ]` prints `[: not found`, returns non-zero and silently takes
+    the **else** branch. The script's `while [ $i -lt 600 ]` performed
+    zero iterations: kmsg has exactly one usbudc line, `usbudc: bind
+    FAILED after 0 tries rc= err=` at 2.840 s, the whole boot has zero
+    `configfs-gadget` lines, and the 900 s autowinch returned the phone
+    to TWRP (12:39, 2026-10-18). An earlier "first bind raced adbd's ep0
+    setup" theory for this same boot was wrong — nothing was ever written
+    to the UDC. Found by chrooting into the Donut `/system` from TWRP and
+    running the shipped script with Donut's own shell; capability map and
+    the generic lesson are in
+    [donut.md](../../advanced/porting-notes/donut.md). The ep1-gate
+    script and the state-aware autowinch that this (wrong) theory
+    produced are gone — see Follow-up 3.
+  - Follow-up 3 (same TEST) — **Donut-shell-safe scripts work: the gadget
+    binds once and stays up; `adb shell` then needed one more fix (and
+    got it).** `usbudc.sh` was rewritten with exit statuses only: after a
+    12 s wait, every 3 s `cmp $UDC /cache/usbudc-unbound >/dev/null
+    2>&1 && echo a800000.dwc3 > $UDC`, plus one `/dev/kmsg` tick per
+    attempt; the reference file holds exactly the unbound UDC content.
+    That content was verified on-device with Donut's own shell against a
+    live *unbound* gadget (`mkdir /config/usb_gadget/testg`, never
+    bound, TWRP's `g1` untouched): unbound UDC = 1 byte `"\n"` (cmp
+    rc 0 → bind), bound UDC = `a800000.dwc3\n` (rc 1 → skip), and
+    `echo "" > /cache/usbudc-unbound` reproduces the unbound content
+    byte-for-byte. Flight evidence (boot 2026-10-18 12:45): kmsg
+    `usbudc: start` 2.897 s, tick 1 14.899 s, `configfs-gadget gadget:
+    high-speed config #1: b` 15.450 s, tick n every 3 s — no unbind, no
+    rebind, no `-19`; host dmesg shows one single `new high-speed USB
+    device … 18d1:4ee7 … maple-donut` (device 37) that stays attached
+    the whole session, `adb devices` → `mapledonut device`.
+    - `adb pull` (sync service) worked at once; `adb shell <cmd>`
+      accepted the request (client trace: `OKAY` right after
+      `shell:<cmd>`) and then hung forever. Root cause was **not** the
+      transport: `service_to_fd`'s `const char* args[2]` was a local
+      array handed to the service thread (stack-use-after-return), so
+      the exec'd child was a bare `/system/bin/sh` with **no `-c`** and
+      waited on stdin. Diagnosed without a shell by `adb pull`ing
+      `/proc/<pid>/cmdline` (15 bytes = `/system/bin/sh\0` only),
+      `/proc/<pid>/wchan` (`pipe_read`) and `/proc/<pid>/syscall`
+      (`3 …` = `read(0, …)`), the pid taken from the bootlog snapshot
+      while a long `adb shell sleep 60` was open.
+    - Fix (patches/donut/system-core.patch): `strdup()` the command in
+      `service_to_fd`, build the `-c <cmd>` args inside `shell_service`,
+      `free()` when the child exits; the same latent bug in `reboot:`
+      (argument points into the freed OPEN packet) fixed the same way.
+      Verification — **verified 2026-10-18 13:01** (boot.img md5
+      `e6ee2096b22c4956dd152f38dc681d98`, flashed by dd with a 17 MB
+      prefix readback match): `adb shell echo hello-donut` →
+      `hello-donut`, `adb shell id` → `uid=0(root) gid=0(root)`, stderr
+      merges (`echo out; echo err >&2` returns both), three consecutive
+      independent shell sessions succeed, `pull`/`push` unchanged. The
+      same boot has the clean USB story: `usbudc: start` 2.837 s, tick 1
+      14.840 s, `configfs-gadget gadget: high-speed config #1: b`
+      15.449 s, ticks every 3 s after, zero `-19`, one host enumeration.
+      The autowinch was killed from the host once the shell was up (pid
+      found by `cat`ing `/proc/<pid>/cmdline` for every `/system/bin/sh`
+      pid) so the session can outlive 15 minutes.
+
+## Bringup log: Donut system_server crash + atomics (2026-10-18)
+
+- **Root cause of the system_server crash loop = barrier-less bionic
+  `__atomic_*` on a weakly-ordered multi-core CPU.** Donut's
+  `bionic/libc/arch-arm/bionic/atomics_arm.S` reimplements
+  `__atomic_cmpxchg/inc/dec/swap` with LDREX/STREX but **omits the full
+  memory barriers** the original kuser helpers provided. `cutils/atomic.h`
+  documents the contract ("all reads or writes issued before
+  android_atomic_* operations are guaranteed to complete before the atomic
+  operation takes place" = full barrier). On the 4-core Cortex-A73
+  (MSM8998, AArch32 compat) this breaks mutual exclusion in bionic
+  pthread mutexes and libutils `futex_mutex` (both call `__atomic_*`),
+  and indirectly Dalvik locking. Symptom: system_server + acore crash loop
+  (10 tombstones in 3 min, 2026-10-18 16:49–16:52), `abort ←
+  mspace_free ← dvmHeapSourceFree ← sweepBitmapCallback ← ... ←
+  gcForExternalAlloc` (heap corruption) and `free ←
+  SharedBuffer::release ← ~String16 ← Parcel::writeInterfaceToken`
+  (fault 0x0d). Controlled experiment: `msptest 3` (4 threads × 1M iters,
+  CAS spinlock + protected counter + malloc churn) = SIGSEGV rc=139 on
+  the old libc, PASS after the fix. Fix: add `dmb sy`
+  (`.word 0xf57ff05f`) before and after every LDREX/STREX in all four
+  `__atomic_*` functions; also rewrite libcutils `android_atomic_swap`
+  (the one remaining `swp`) as LDREX/STREX+dmb. Verified:
+  `msptest 3` and `msptest 4` (atomic conformance) PASS on both the TWRP
+  kernel (4.4.263) and the Donut kernel (4.4.302) with the fixed libc
+  (md5 `2b6469277b6c4375849ea3c0d96f85d3`) and libcutils (md5
+  `af710d64a95e0936f8841de6f37afe44`); baseline (barrier-less) `msptest
+  3` = SIGSEGV on both kernels.
+- **Kuser helpers exist on this kernel** (`CONFIG_KUSER_HELPERS=y`,
+  `CONFIG_COMPAT=y`); the kuser page is mapped at 0xffff0000 with version
+  word 0x00000005. The kuser-based `android_atomic_*` (libcutils, full
+  barrier) all pass conformance. The earlier "kuser/page missing"
+  hypothesis was wrong: the trap was `swp`, not a missing page.
+- **SWP emulation is on** (`CONFIG_SWP_EMULATION=y`) — `swp` is emulated
+  (slow, not fatal), so the original crash was heap corruption from the
+  missing barriers, not an instruction fault. `swp` traps on ARMv8 without
+  emulation; the LDREX rewrite avoids the dependency entirely.
+- **Secondary stopper: `com.android.phone` OOMs on the lock screen.**
+  With the heap still at the Donut default (16 MB growth limit), the
+  lock-pattern wallpaper bitmap (28 KB external alloc) overflowed the
+  budget: `dalvikvm-heap: 28900-byte external allocation too large for
+  this process` → `OutOfMemoryError: bitmap size exceeds VM budget` in
+  `LockPatternView.getBitmapFor` → `InflateException` on `UnlockScreen`
+  (Binary XML line #60) → WindowManagerPolicy thread dies → main-thread
+  NPE at `ViewRoot.setView` (ViewRoot.java:428) → `I/Process: Sending
+  signal … SIG: 9` → zygote exits → init restarts zygote → crash loop.
+  Fix: set `USE_CUSTOM_RUNTIME_HEAP_MAX := 512m` in `BoardConfig.mk` —
+  Donut's dalvik ignores the `dalvik.vm.heap*` props (those are a
+  Honeycomb+ invention) and reads the max heap only from `-Xmx`, which
+  defaults to 16 m (`AndroidRuntime.cpp` uses `-Xmx16m` unless
+  `USE_CUSTOM_RUNTIME_HEAP_MAX` is defined). The `dalvik.vm.heap*` lines
+  in `system.prop` are kept for documentation only. Also
+  `com.android.phone` crashed separately: `PhoneApp.onCreate` →
+  `PhoneUtils.setAudioMode` → `AudioManager.setMode` NPE (audio service
+  not yet registered at that instant); made `AudioManager.setMode`
+  null-safe. `patches/donut/` (AudioManager null-safety).
+- **Bringup instrumentation added (TEMP, remove before release):**
+  - `/dev/log` FIFO shim (`devices/maple/donut/logshim/logshim.c`,
+    static binary `/sbin/logshim`): creates
+    `/dev/log/{main,radio,events}` FIFOs at `on init` (via `exec
+    /sbin/logshim --init`) and mirrors each to
+    `/cache/logcat-{main,radio,events}.txt` via a non-blocking reader
+    service defined before zygote. Donut's liblog opens all three with
+    O_WRONLY and disables logging if any fails, so all three are
+    required. Records are raw `[priority][tag\0][msg\0]` (no
+    logger_entry header); `tools/parse-logcat.py` untangles the main one.
+  - `system/core/init/init.c` `zap_stdio()`: stderr now goes to
+    `/dev/kmsg` instead of `/dev/null`, so crash output (Java uncaught
+    exception traces, linker errors) lands in `/cache/kmsg.txt` (already
+    captured + rotated + fsync'd by klogd). TEMP bringup patch.
+  - Both are logged as bringup-only in the device tree; remove once the
+    port is stable (AGENTS.md patch-set discipline).
+- **Validation:** `msptest 4` (conformance) + `msptest 3` (4 threads ×
+  1M iters) PASS on both TWRP (4.4.263) and Donut (4.4.302) kernels
+  with the fixed libc (md5 `2b6469277b6c4375849ea3c0d96f85d3`) and
+  libcutils (md5 `af710d64a95e0936f8841de6f37afe44`); baseline
+  (barrier-less) `msptest 3` = SIGSEGV (rc=139) on both kernels.
+
+## Bringup log: Donut touch panel + keyguard (2026-10-18)
+
+- **TEST 43 — the clearpad panel stays silent until userspace writes
+  `post_probe_start`; `vtouch` now does it (Donut 1.6 has no init trigger
+  for it).**
+  - Symptom: touch works nowhere in Donut — `getevent` on vtouch's
+    virtual node (`/dev/input/event7`) and on the preserved real node
+    (`/dev/input/vtouch_saved`) both show zero events while a finger
+    drags across the panel, and the lock screen never reacts. The
+    framework side looks fine: EventHub/KeyInputQueue accept
+    `maple_vtouch` (id 0x10000, ABS_X 0..2159 / ABS_Y 0..3839), so the
+    fault is below the relay.
+  - Diagnosis: boot dmesg has `clearpad clearpad: (clearpad_probe:9356)
+    post_probe_start sysfs is required to start post probe` — the driver
+    finishes i2c probe (~1.8 s) and then parks: panel powered but silent
+    (no IRQ, no events). The gate
+    `/sys/devices/virtual/input/clearpad/post_probe_start` (class symlink
+    `clearpad -> input7`) reads `0` until the first write.
+  - Runtime proof: writing `1` makes dmesg show `start post probewith
+    post_probe_start sysfs` → `begin 'post probe' session` → `ensure
+    firmware` → device id `PLG1163-C1` (family 0xd1, fw rev 0x03.02) →
+    `end post probe ... (rc=0)`, and the same finger drag then produces
+    5800 raw protocol-A events on the real node and 1571 translated
+    events (BTN_TOUCH + ABS_X/Y) on the virtual one — the clearpad →
+    vtouch → Donut chain is good once the panel is awake.
+  - Where the write comes from elsewhere: stock Sony init, the KitKat
+    port (`devices/maple/kitkat/init.maple.rc`, `on post-fs-data`) and
+    TWRP (`/init.recovery.maple.rc`, `on post-fs`: `# start
+    clearpad_post_probe when filesystem is available for fwflash`) —
+    which is why the touch screen works in recovery on the same kernel.
+    Donut 1.6's init has no `post-fs`/`post-fs-data` triggers at all
+    (`system/core/init/init.c` queues `early-init`/`init`/`early-boot`/
+    `boot` + property triggers), and the sysfs node only appears during
+    kernel probe (~2.9 s in this boot), so a one-shot `on boot` write
+    can silently race it.
+  - Fix: `devices/maple/donut/vtouch/vtouch.c` `start_post_probe()` —
+    run after the virtual-node substitution (system_server's one-shot
+    input scan must still find `maple_vtouch`) and before the relay
+    loop; opens `/sys/devices/virtual/input/clearpad/post_probe_start`
+    (stable symlink path — never hardcode `inputN`) and writes `1`,
+    retrying 1x/s for up to 60 s. No events can exist before the write,
+    so the wait loses nothing.
+  - Verification: runtime side done (above). Boot side verified (2026-10-19) — on
+    the first boot of the vtouch-write build: dmesg post probe with no
+    manual poke + `/dev/.vtouch.log` `touch panel post probe started
+    (try N)`. Verified on the vtouch-write build (2026-10-19): dmesg shows
+     clearpad_post_probe_start_store -> start post probe @ 3.043 -> ensure
+     firmware -> end post probe ... (rc=0) with no manual poke, and
+     /dev/.vtouch.log shows `touch panel post probe started (try 0)` +
+     `relaying on /dev/input/event7`. The same boot also exposed the
+     firmware-fallback stall (TEST 45).
+- **TEST 44 — no MENU key on this hardware: the camera shutter full
+  press now sends MENU, and the keyguard unlocks on a tap.**
+  - Background: Donut predates action bars; the non-secure keyguard's
+    only unlock input is `KEYCODE_MENU` (`LockScreen.onKeyDown` →
+    `mCallback.goToUnlockScreen()` → `keyguardDone(true)`), and apps
+    expect a MENU key too. The lock screen hint said "Press Menu to
+    unlock." — a button that does not exist.
+  - Hardware: `getevent` with no device argument (TWRP, same kernel)
+    shows the two-stage shutter on `gpio-keys`/event6 emitting clean
+    pairs — half press `0001 0210` (KEY_CAMERA_FOCUS 528), full press
+    `0001 02fe` (KEY_CAMERA_SNAPSHOT 766); 16 down/up pairs for 16
+    presses. First proof the button works at all.
+  - Fix 1 — physical MENU: `devices/maple/donut/gpio-keys.kl` maps
+    `key 766 MENU WAKE_DROPPED` (full press only — a full press also
+    emits the half-press code, so mapping both to MENU would fire two
+    MENU presses per press and toggle a just-opened menu shut). The half
+    press (528) is now `BACK` (no wake flag) for in-app navigation
+    (was `FOCUS`); the camera's autofocus on half-press is given up for
+    this (camera HAL is not started on this port). Tokens checked against
+    Donut's
+    `frameworks/base/include/ui/KeycodeLabels.h` (`MENU`=82, `FOCUS`=80,
+    `CAMERA`=27) because `KeyLayoutMap` discards the whole file on an
+    unknown token.
+  - Fix 2 — tap to unlock: `LockScreen.onTouchEvent` calls the very same
+    `mCallback.goToUnlockScreen()` on ACTION_DOWN; a secure keyguard
+    still routes through its own `UnlockScreen`. The keyguard window is
+    touchable (`KeyguardViewManager`: TYPE_KEYGUARD with
+    FLAG_FORCE_NOT_FULLSCREEN / optional FLAG_ALT_FOCUSABLE_IM — no
+    FLAG_NOT_TOUCHABLE) and no child consumes touches outside the
+    emergency button, so the tap lands on the LockScreen view. Hints
+    updated to "Tap to unlock." / "Tap to unlock or place emergency
+    call.".
+  - The SIM-missing keyguard trap: `stuckOnLockScreenBecauseSimMissing()`
+    (`mRequiresSim && !isDeviceProvisioned() && simState == ABSENT`) and
+    PUK_REQUIRED make `goToUnlockScreen()` a silent no-op; the port's
+    `system.prop` already sets `keyguard.no_require_sim=true` (so
+    `mRequiresSim` is false), and the dead-end SIM lock screen can never
+    appear (the test device has no SIM anyway).
+  - Patches:
+    `patches/donut/frameworks-policies-keyguard-touch-unlock.patch`
+    (apply from `aosp-donut/frameworks/policies/base`) and
+    `patches/donut/frameworks-base-keyguard-touch-unlock.patch` (apply
+    from `aosp-donut/frameworks/base`).
+  - Verification: hardware codes above. Verified (2026-10-19): tap unlocks
+    the keyguard ("Tap to unlock."), camera full press (766) delivers MENU
+    (launcher menu opens), volume up/down work, and the launcher stays up
+    (no crash loop). The keychar fix (0644) is what made the launcher
+    stable.
+- **adb's device serial tells you which boot you are in.** Donut boots
+  advertise `mapledonut`; TWRP advertises the phone's own serial +
+  `recovery` (`CB512EGGHD  recovery`) and does NOT mount `/system`
+  (`ls /system/bin` → `No such file or directory`, tools look
+  "missing"). Check `adb devices` before debugging a vanished binary.
+
+## Bringup log: Donut default orientation stuck in landscape (2026-10-19)
+
+- **TEST 48 — the flip-cover hall sensor (bu520x1nvx) reports "lid open" and
+  Donut forces landscape.**
+  - Symptom: the home screen (and every app) renders in landscape
+    (horizontal) on a portrait panel; rotating the phone does nothing
+    (no auto-rotate — the sensor HAL, `sensors.maple.so`, is absent).
+  - Diagnosis: `WindowManagerService` logged `Setting rotation to 1,
+    animFlags=1` on every boot. `PhoneWindowManager.rotationForOrientationLw`
+    returns `Surface.ROTATION_90` (1) when `mLidOpen` is true, and
+    `readLidState()` sets `mLidOpen = (getSwitchState(0) == 0)`. The
+    bu520x1nvx hall sensor (flip-cover, SW_LID, input4) reports 0 with no
+    cover attached, so Donut treats the flip cover as a sliding keyboard
+    being opened and forces landscape. The framebuffer itself is 1080x1920
+    (portrait) and touch coordinates already match it; only the rotation
+    policy is wrong.
+  - Fix: `frameworks/policies/base/.../PhoneWindowManager.java`:
+    `KEYBOARD_ALWAYS_HIDDEN = false -> true` (maple has no sliding
+    keyboard), and guard the lid-open branch with `!KEYBOARD_ALWAYS_HIDDEN`,
+    so a flip-cover "open" no longer forces landscape. Recorded as
+    `patches/donut/frameworks-policies-orientation.patch` (applied from
+    `aosp-donut/frameworks/policies/base`).
+  - Verification: verified on the orientation-fixed image (2026-10-19) —
+    home screen is upright (portrait) and stays portrait (no auto-rotate
+    without the sensor HAL, which is absent on this port).
+
+## Bringup log: power button handling (2026-10-19)
+
+- **TEST 47 — the power button is handled by the kernel's `powerkey_handle`,
+  not by Android's input system, and is blocked by USB debugging.**
+  - Symptom: pressing the power button does nothing visible while the phone
+    is on USB (adb). dmesg shows the kernel *does* react:
+    `registering powerkey_handle handle for qpnp_pon` at boot, and each
+    press logs `PM: suspend entry` -> `msm-dwc3 a800000.ssusb: Abort PM
+    suspend!! (USB is outside LPM)` -> `PM: suspend exit`. The qpnp_pon
+    input node declares only scancodes 19/20 (KEY_R/KEY_T) in its
+    capability bitmask and delivers no evdev events to userspace, so
+    Android's input system never sees a `KEYCODE_POWER`.
+  - Diagnosis: the PMIC power key is handled at the kernel level by
+    `powerkey_handle`, which attempts a full system suspend. With USB
+    debugging active the USB controller is not in low-power mode, so the
+    suspend is aborted and the screen stays on — "nothing happens". With
+    USB unplugged the suspend succeeds and the screen locks (kernel path).
+    `PowerManagerService.goToSleep()` does not turn off the display in this
+    port either: sleep goes through the ported lights HAL, not
+    PowerManagerService, so there is no Android-level lock path today.
+  - Attempted/considered fixes: a keylayout entry for qpnp_pon cannot help
+    (no evdev events arrive); a userspace daemon tailing `/dev/kmsg` for
+    `PM: suspend entry` and calling `service call power 2 i32 <uptime>`
+    (goToSleep) does not turn off the display in this port; turning the
+    backlight off via `/sys/class/backlight/panel0-backlight/brightness`
+    would only blank the panel, not lock. A real fix needs either the
+    PM->lights integration in PowerManagerService or a kernel change making
+    qpnp_pon report `KEY_POWER` via evdev (kernel source is a prebuilt blob
+    here, `work/maple-donut/kernel-Image.gz-dtb`).
+  - Workarounds documented: unplug USB and the power button locks the
+    screen (kernel path); during development use
+    `adb shell "service call power 2 i32 0"` is a no-op for display, so use
+    `adb shell "echo 0 > /sys/class/backlight/panel0-backlight/brightness"`
+    to blank and `echo 4095 > .../brightness` to restore. Not blocking the
+    port; tracked as an open item.
+
+## Bringup log: Donut touch firmware fallback + key character maps (2026-10-19)
+
+- **TEST 45 — the clearpad post probe is gated behind a 3x60 s firmware-load
+  fallback.**
+  - Symptom: touch works nowhere for ~3 minutes after every boot, then
+    suddenly works (lock screen starts responding to taps, home screen
+    usable). Rebooting and testing within the first 3 minutes reproduces
+    "touch is broken"; waiting past ~3 minutes "fixes" it. The panel is not
+    actually broken — the kernel driver is busy.
+  - Diagnosis: dmesg timeline on a clean boot: `[3.043] start post probe` ->
+    `[3.306] ensure firmware` -> `[63.336] retry fwflash (0)` ->
+    `[123.390] retry fwflash (1)` -> `[183.443] retry fwflash (2)` ->
+    `[183.496] WA for Yoshino BU` -> `[183.759] end post probe @ 183.759
+    (rc=0)`. Each `retry fwflash (N)` is preceded by a 60 s
+    `request_firmware(touch_module_id_0xd1.img)` wait that fails with
+    rc=-11 (EAGAIN) because Donut has no userspace firmware loader (no
+    ueventd firmware handling); the driver retries 3x, then resets the
+    panel (SW reset) and completes the post probe. Touch emits only after
+    that. Confirmed by the user: "touch started working on home screen" on a
+    boot older than ~3 minutes, "touch stopped working after restarting"
+    (reboot, tested inside the 3-minute window), and "It reacts now" at
+    uptime 328 s (> 184 s).
+  - Knob: the firmware class exposes a class attribute
+    `/sys/class/firmware/timeout` (default 60, seconds) — the wait length.
+    Writing `1` makes each retry fail in ~1 s, so the whole post probe
+    finishes ~4 s after the kick instead of ~184 s. Confirmed writable on
+    this kernel (readback 1).
+  - Fix: `devices/maple/donut/vtouch/vtouch.c` `set_fw_timeout()` writes `1`
+    to that attr first thing in `start_post_probe()` (before the
+    post_probe_start write), so the driver sees the new timeout before its
+    first request. Version bumped to v1.2.0-maple3. No belt-and-suspenders
+    write in init is needed: no other driver requests firmware during boot on
+    this port (dmesg shows zero other `fw request` lines), and vtouch runs
+    at ~3 s, before the first request at ~3.3 s.
+  - Verification: knob write verified live (readback 1); the driver refuses
+    to re-run once post probe has completed (`clearpad_post_probe_start_store:
+    already post probed, need reboot`), so the end-to-end timing
+    (`end post probe @ ~7 s`) is verified only after the next flash+reboot.
+    Verified on the maple3 image (2026-10-19): dmesg shows `end post probe
+    @ 6.529345232 (rc=0)` with retries at 4.10/5.16/6.21 s, vtouch log
+    shows `firmware load timeout set to 1s`, and touch responds on the lock
+    screen within seconds of boot (user-confirmed "touch works off the bat").
+  - Generic lesson: porting-notes/donut.md "Firmware loads that wait for a
+    missing userspace helper".
+
+- **TEST 46 — key character maps shipped mode 0640: Settings/Launcher
+  SIGSEGV.**
+  - Symptom: opening Settings (or any app that loads a key character map)
+    crashes the app with SIGSEGV. logcat shows
+    `W/KeyCharacterMap: Can't open keycharmap file '/system/usr/keychars/
+    gpio-keys.kcm.bin'` then `E/KeyCharacterMap: Can't find any keycharmaps
+    (also tried /system/usr/keychars/qwerty.kcm.bin)` then
+    `I/DEBUG: signal 11 (SIGSEGV), fault addr 00000004` with
+    `#00 pc ... /system/lib/libui.so` -> `#02 ... /system/lib/
+    libandroid_runtime.so` -> `#03 ... /system/lib/libdvm.so`. Tombstones
+    tombstone_01/02/04/05/09 are com.android.settings; tombstone_00/03/06/07/
+    08 are android.process.acore (the Launcher, which runs in that process on
+    Donut). The launcher crash loop observed earlier in the bringup (TEST
+    43/44 timeframe) is the same fault.
+  - Root cause: `build/tools/kcm/kcm.cpp` creates the `.kcm.bin` files with
+    `open(..., O_RDWR|O_CREAT|O_TRUNC, 0660)`. The build's umask (022) leaves
+    them 0640 (`root:root`, no other-read), so app processes (uid app_*)
+    cannot open them (`open()` returns EACCES -> `try_file()` returns NULL
+    -> `KeyCharacterMap::load()` returns NULL -> the native JNI path
+    dereferences it -> fault addr 4). The keylayout (`.kl`) and idc files
+    are 0644 and load fine, so the camera->MENU mapping and touch idc were
+    never affected by this.
+  - Fix: `build/tools/kcm/kcm.cpp` 0660 -> 0644 plus `fchmod(out, 0644)`
+    (creat mode alone is masked by umask), recorded as
+    `patches/donut/build-kcm-file-mode.patch` (applied from
+    `aosp-donut/build`); plus belt-and-suspenders `chmod 0644` on
+    `*.kcm.bin` in `scripts/build-maple-donut-image.py`. The packaging
+    script's chmod is what makes the flashable image correct even if the host
+    tool is unpatched.
+  - Verification: runtime side verified (debugfs showed the image's
+    `/usr/keychars/*.kcm.bin` at mode 0640 before the fix; logcat showed the
+    crash backtrace in libui; after the fix the files are 0644 in the new
+    image). Flash side verified (2026-10-19): the device's
+    `/system/usr/keychars/*.kcm.bin` are mode 0644, logcat shows 0
+    `Can't find any keycharmaps` warnings and 0 `has died` lines on the
+    fresh boot, and Settings opens without crashing.
+
+## Bringup log: libhyb, the in-process Adreno driver (2026-10-18)
+
+- **TEST 49 (owner: "glrenderd must become obsolete" — port
+  [DoomGuy41/Taimen-KitKat](https://github.com/DoomGuy41/Taimen-KitKat);
+  2026-10-18):** the graphics stack is replaced. `libhyb`
+  (`devices/maple/kitkat/hyb/`) loads the LineageOS 22.1 (Android 15)
+  closure — Adreno 540 driver, QTI gralloc1, dependencies — **directly into
+  every KitKat process**; `egl/` shims keep the KitKat library names and
+  forward (GLES through generated per-function stubs); `gralloc.maple`
+  provides gralloc 0.2 + the fb HAL on the QTI gralloc1 (real ION buffers
+  with the QTI handle, cloned across processes); `fbpresentd/` (64-bit,
+  NDK-built) presents through an **MDSS atomic commit** on DMA0 with
+  copy + `FBIOPUT_VSCREENINFO` as the fallback. The chroot, the emugl
+  transport, `tools/glrenderd/`, the four `*glrenderd*` patches, the
+  `patches/kitkat/files/` overlay, `BUILD_EMULATOR_OPENGL`, the goldfish
+  guest libs and the `GLConsumer` bound are **gone**; **TEST 30–41 above
+  describe the superseded glrenderd design** — kept as history, their
+  tooling/patches are deleted. Full writeup:
+  [libhyb](../../advanced/software/libhyb.md).
+  - **Build evidence (server, 2026-10-18):** closure staged by
+    `tools/libhyb/stage.py` from a Lineage 22.1 zip — 19 libs
+    (`vendor/lib/egl`: driver + `eglSubDriverAndroid` + `libq3dtools`;
+    `vendor/lib`: `libc++`, `libgsl`, `libllvm-glnext`,
+    `libgrallocutils`, `libqdMetaData`, …; `system/lib`: `libsync`,
+    `libvndksupport`) + a530/a540 firmware, with `libc/libm/libdl/liblog/
+    libcutils/libz/ld-android/libdl_android` resolved to **KitKat's own**
+    bionic. `fbpresentd` built aarch64 static (NDK r21e, 4.0 MB).
+    Image contents verified: `/system/lib/libhyb.so`,
+    `/system/lib/hw/gralloc.maple.so`, `/system/lib/egl/{egl.cfg,
+    libEGL_adreno.so, libGLESv1_CM_adreno.so, libGLESv2_adreno.so,
+    libGLES_android.so}`, `/system/bin/{fbpresentd,hybtest,rtc-restore}`,
+    `/system/a15/{vendor,system}/...`.
+  - **KitKat's EGL loader does not read `egl.cfg`.** `Loader.cpp` scans
+    `/vendor/lib/egl` then `/system/lib/egl` with readdir for
+    `libEGL_*.so` and takes **the first hit** (it explicitly skips only
+    `libGLES_android.so`); `egl.cfg` is inert at runtime on this release.
+    With the emulation libs (`libEGL_emulation.so`, …) still present the
+    choice of driver was readdir-order luck — hence the emulation libs are
+    not built any more, and a stale copy in the out tree must be deleted.
+    (Verified against the server tree's `Loader.cpp`, lines 265–350.)
+  - **Removing files from `PRODUCT_*` does not remove them from the out
+    tree.** The first libhyb image silently shipped the whole 25 MB
+    `system/glr/` chroot, `libEGL_emulation.so` + friends,
+    `libOpenglSystemCommon.so`, `lib*_enc.so` and `/sbin/glrenderd.sh`:
+    `mkuserimg.sh` packs whatever `out/target/product/maple/system` holds,
+    and dropped `PRODUCT_COPY_FILES`/`PRODUCT_PACKAGES` entries leave the
+    old files (owned by root from the container build) behind. Fix: delete
+    the stale paths from the out tree and rebuild the images
+    (`cleanup-rebuild.sh` on the server). Any "why is this file still in
+    my image?" ends here.
+  - **`LOGI` is not a KitKat macro.** `cutils/log.h` includes
+    `log/log.h`, which defines `ALOGI`/`ALOGE` — the first `rtc-restore`
+    build failed at link with `undefined reference to 'LOGI'` (the
+    unexpanded name became an implicit function call).
+  - **`__tls_get_addr`: the "risk closed by inspection" verdict was
+    wrong.** The build-time walk (`llvm-objdump` over `libc++`, `libutils`,
+    `libhidlbase`, `libgsl`, `libllvm-glnext`, `libgrallocutils`,
+    `libqdMetaData`) found 0 call sites, and `hooks.c` shipped an aborting
+    tripwire on that basis. The closure *does* need TLS, though:
+    `libc++`, `libutils` and `libhidlbase` carry `R_ARM_TLS_DTPMOD32`
+    relocations (5, all symbol index 0, `PT_TLS` a pure `.tbss`), and the
+    first libhyb boot died on them (zygote killed at `preloadOpenGL`,
+    surfaceflinger aborting in `init()`). A relocation is not a call site —
+    `readelf -r` on the closure, not a disassembly symbol search, is what
+    answers "does this need TLS". The loader now implements
+    DTPMOD32/DTPOFF32 plus a real `__tls_get_addr` (fix and evidence at the
+    end of this TEST).
+  - **32-bit `MSMFB_ATOMIC_COMMIT` crashes the kernel** (from the Taimen
+    port; `verify-me` on maple): that is why `fbpresentd` is a 64-bit
+    out-of-tree binary. The copy fallback still works from 32-bit
+    (`FBIOPUT_VSCREENINFO` + yoffset, TEST 30).
+  - **hwui is enabled now** (`USE_OPENGL_RENDERER := true` in
+    BoardConfig, Taimen parity): the glrenderd-era builds never set it, so
+    `libhwui` was not built at all (the UI thread drew in software and only
+    SurfaceFlinger composited on the GPU). With a real ES2/ES3 driver in
+    the process the accelerated UI path is the point of the port, and the
+    `frameworks-base-hwui-gles2-cap.patch` keeps hwui on its tested ES2
+    behaviour. First-flash check: `dumpsys gfxinfo` shows real draw times
+    and `libhwui.so` is in `/system/lib`. Taimen also sets
+    `TARGET_DISABLE_TRIPLE_BUFFERING := true` (two app buffers instead of
+    three) — a candidate tuning here, not adopted without measurement.
+  - **The closure's TLS relocations made the driver unloadable (fixed
+    2026-10-19).** Symptom: on the first libhyb boot every GL consumer
+    died at once — zygote was killed a few seconds after start (last
+    message before the kill: `ZygoteInit.preloadOpenGL()`,
+    `ZygoteInit.java:237-245`) and surfaceflinger aborted inside
+    `SurfaceFlinger::init()+86`. Root cause: the Android 15 closure's
+    `libc++.so`, `libutils.so` and `libhidlbase.so` carry
+    `R_ARM_TLS_DTPMOD32` relocations (5, all with symbol index 0, slots in
+    RW/RELRO segments, `PT_TLS` a pure `.tbss` with filesz 0) and the
+    loader rejected unknown relocation types, so `libEGL_adreno.so` never
+    came up. Fix: real thread-local support in
+    [`hyb/linker.c`](../../../devices/maple/kitkat/hyb/linker.c) — a module
+    table (`hyb_tls_register` at load, `DT_TLS` captured in `map_file`),
+    `DTPMOD32`/`DTPOFF32` resolved against it, and a `__tls_get_addr` that
+    lazily allocates (and caches, per thread) one `posix_memalign` block per
+    module, copying the `PT_TLS` template. Only `DTPMOD32` is actually
+    used, 17 occurrences, all symbol 0 → module = self.
+    `R_ARM_TLS_TPOFF32` is deliberately *not* implemented and fails loudly
+    (same inspection that found `__emutls_get_address` absent, TEST 49
+    build evidence). Verified: `hybtest` gets an ES3 context
+    (`EGL 1.5`, `Adreno (TM) 540`, `OpenGL ES 3.2 V@331.0`), green clear
+    pixel-checks, and clears 2000 frames + `glFinish` in 18.2 ms. Driver
+    load takes 9 ms in-process.
+  - **The GPU and ION nodes are root-only, and nothing non-root could
+    render (fixed 2026-10-19).** Symptom: surfaceflinger aborted with
+    `LOG_ALWAYS_FATAL("no suitable EGLConfig found, giving up")`
+    (`SurfaceFlinger.cpp:407` → `selectConfigForAttribute` at 321 — all
+    three attempts returning 0 configs) while the same closure rendered
+    fine in `hybtest`. Root cause, visible only from a root-run
+    surfaceflinger (see the logging item below): `Adreno-GSL:
+    <ioctl_kgsl_driver_entry:777>: open(/dev/kgsl-3d0) failed: errno 13.
+    Permission denied`, `qdgralloc: Init: Failed to open ion device -
+    Permission denied`, then `libEGL: eglInitialize(...) failed
+    (EGL_BAD_ALLOC)` — KitKat's `eglChooseConfig` reports every config as
+    missing once `eglInitialize` failed, which is what the fatal assert
+    really meant. The kernel creates both nodes `root:root 0600` and
+    `ueventd.maple.rc` had no rules: the glrenderd design never needed
+    them, its renderer ran as root inside the chroot. Fix:
+    `/dev/kgsl-3d0` and `/dev/ion` at 0666 in
+    [`ueventd.maple.rc`](../../../devices/maple/kitkat/ueventd.maple.rc)
+    (0666 rather than a group rule: the callers are uid `system`, app uids
+    `u0_aNN` and root, and DAC is the whole story on this
+    SELinux-permissive port). A live `chmod 666` on an already-booted
+    device confirms the fix without a reflash; the rules only take effect
+    from a reflashed ramdisk. Related trap: **init's surfaceflinger
+    service has `onrestart restart zygote`** (stock KitKat), so an SF
+    crash-loop kills zygote every few seconds and the framework never
+    gets through `preloadClasses` — one graphics bug presented as three
+    unrelated failures (zygote restart loop, SF abort, no boot).
+  - **A service's `ALOG*` output goes nowhere unless `/dev/kmsg` is
+    writable (diagnosed 2026-10-19).** init gives services `/dev/null` as
+    stdout/stderr and this kernel has no `/dev/log`, so liblog's kmsg
+    fallback ([`patches/kitkat/README.md`](../../../patches/kitkat/README.md))
+    is the only sink — but `open("/dev/kmsg", O_WRONLY)` from uid `system`
+    fails EACCES and liblog then points `write_to_log` at
+    `__write_to_log_null`: the message is dropped with no error anywhere.
+    Only root processes (liblog opens kmsg itself) and zygote's
+    descendants (they inherit zygote's already-open fd) ever reached
+    dmesg, so app and system_server logs were visible while
+    surfaceflinger, netd and media were mute. Fix: `chmod 0622
+    /dev/kmsg` early in
+    [`init.rc`](../../../devices/maple/kitkat/init.rc) — 0622, not 0666:
+    non-root services may write the kernel log, reading stays root-only
+    (`dmesg` needs CAP_SYSLOG anyway). Verify with
+    `log -p i -t TESTTAG hi; dmesg | grep TESTTAG` as a non-root uid, or
+    from the booted device by running a service by hand (a root-run copy
+    opens kmsg itself: `stop surfaceflinger; surfaceflinger`).
+  - **Zero-copy presentation leaves fb0 black (trap, 2026-10-19).** With
+    the atomic-commit path active fb0's memory is never written — DMA0
+    scans the ION buffer itself. A `dd if=/dev/graphics/fb0` readback of a
+    perfectly driven panel is all zeros (both pages, `pan 0,0`), so the
+    fb0-decode checks from the glrenderd era say nothing here; use
+    `fbpresentd`'s commit lines below, `dumpsys SurfaceFlinger`, or force
+    the copy path (`persist.gralloc.fb_commit=0`) when a readback is what
+    you want.
+  - **KitKat's screen timeout is 60 s** (`def_screen_off_timeout`), so a
+    panel that is dark a minute after boot is the framework working, not a
+    dead backlight: `/sys/class/leds/lcd-backlight/brightness` reads 0 and
+    `settings put system screen_brightness 200` (idempotent; the lights HAL
+    writes both lcd-backlight and wled) brings it back.
+  - **`fbpresentd` now logs through `/dev/kmsg`** (init gives daemons
+    /dev/null): `ready`, `client connected/disconnected`, commit failures
+    with `strerror`/layer error code, the first three commits, and one line
+    every 600 commits with a measured rate —
+    `fbpresentd: commit #600 1080x1920: previous frame scanned out, 59.9 fps`.
+    The release-fence state is the panel evidence: the MDP only signals the
+    previous commit's `release_fence` once DMA0 has read the buffer for
+    scanout, so "scanned out" separates a driven panel from commits the MDP
+    merely accepted (a fence that never signals inside 100 ms is logged as
+    `NOT scanned out in 100 ms`).
+  - **On-device results (2026-10-19, first boot with the driver in the
+    boot path).** `dmesg | grep -i hyb` shows the closure loading in order
+    (`libc++`, `libutils`, `libhidlbase`, `libgsl`, `libllvm-glnext`, …,
+    `egl/libEGL_adreno.so`, `egl/libGLESv2_adreno.so`), then
+    `egl_adreno: Adreno 540 driver ready (gralloc import ok)`;
+    `gralloc.maple` reports `fb0 1080x1920, line 4352 bytes, double buffer
+    1, BGRA 0, atomic commit 1`; `dumpsys SurfaceFlinger` reports
+    `GLES: Qualcomm, Adreno (TM) 540, OpenGL ES 3.2 V@331.0`, `EGL
+    implementation: 1.5`, `EGL_NATIVE_VISUAL_ID: 1`, `refresh-rate:
+    60.000002 fps`, with the built-in display's layers composing at
+    1080x1920; and the boot reaches `sys.boot_completed=1` with
+    `init.svc.surfaceflinger=running` and `init.svc.bootanim=stopped`
+    without any manual step (the previous image needed the live
+    `chmod 666`, this one has the rules in the ramdisk). Node readback on
+    that boot: `crw-rw-rw- root root /dev/kgsl-3d0`, `crw-rw-rw- root
+    root /dev/ion`, `crw--w--w- root root /dev/kmsg`.
+  - **Backlight timeline on a cold boot (2026-10-19).** Full brightness
+    during the boot animation (`4095`, left by the kernel/bootloader),
+    then the framework takes over and both nodes read `1638`
+    (`mScreenBrightnessSetting=102` scaled to 0-4095) — the lights HAL
+    path of TEST 41 still works with libhyb; the panel is dark again a
+    minute later because `def_screen_off_timeout` is 60000 (stock) and
+    dims instead of switching off when `stay_on_while_plugged_in`
+    matches.
+  - **fps 59.5-60.0 measured, 59.9 reported by the presenter.**
+    `dumpsys SurfaceFlinger --latency
+    com.android.settings/com.android.settings.Settings` during a swipe
+    scroll: 127 frames over 2.10-2.12 s = 59.5/60.0 fps; the presenter's
+    600th-commit line reports `59.9 fps while active` for the same kind of
+    burst (50.7 for a slow scroll). **Trap:** the first version of that
+    line averaged over the whole window including idle gaps — SF posts
+    *nothing* while the screen is static — and printed `2.3 fps` while
+    `--latency` said 60.0; the metric now skips gaps over 100 ms, which is
+    what "while active" means.
+  - **`persist.gralloc.fb_commit=0` A/B (2026-10-19).** gralloc logs
+    `atomic commit 0`, the copy +
+    `FBIOPUT_VSCREENINFO`-yoffset path takes over, and fb0 readback now
+    contains the composed frame in *both* pages (`dd if=/dev/graphics/fb0
+    bs=4194304 count=4`, 2093/2108 sampled pixels non-zero); decoding with
+    the 4352-byte line (1088 px) stride and cropping to 1080x1920 gives a
+    clean UI frame — ~35k distinct colours, the KitKat wallpaper and
+    status/nav bands in place,
+    ![decoded fb0 frame](fb0-decode-copy-path-2026-10-19.png) — the TEST 30
+    fb0-decode check still works on this path, and that is how the copy
+    fallback itself was verified. Restored `persist.gralloc.fb_commit=1` and
+    reflashed: the property lives in /data, so it survives a system flash —
+    reset it by hand if an A/B is left behind, otherwise the device stays on
+    the slow path.
+  - **Panel stays up (idle power collapse).** After ~15 min of a static
+    screen the backlight still reads `1638` and the next swipe burst
+    presents at `59.9 fps while active` with every release fence
+    signalling — the DMA0 pipe did not collapse. The DT property strip
+    (`qcom,mdss-idle-power-collapse-enabled`, step 4 of the build docs) is
+    in the flashed kernel (md5 `4a7b3eaf…`). Visual confirmation over a
+    long idle still belongs to the owner; this is the automated
+    evidence.
+
+## Bringup log: audio — ACDB calibration + framework playback (2026-10-19)
+
+- **TEST 50 (owner: audio parity with
+  [DoomGuy41/Taimen-KitKat](https://github.com/DoomGuy41/Taimen-KitKat);
+  2026-10-19):** **playback through the framework works.** An `AudioTrack`
+  tone (`audiotrack_test`) plays through AudioFlinger and
+  `audio.primary.maple`; a parallel DMIC capture shows the 440 Hz tone at
+  **~99 % of the 150–3000 Hz band energy** for three consecutive seconds
+  (peak ~180–240 at music volume 11/15; the quiet control sits at 0.02–0.08),
+  with no `cal_block` errors in dmesg. Verified on the flashed images
+  (boot.img `0b0e750db3d6b6381d1e17f95e89af8c`, sparse system.img
+  `3b3d03bf03744ee8d468a0cd8039e7fd`; TWRP md5 readbacks matched). The
+  chain, in the order it bit:
+  - **No calibration means no audio, even with a running PCM.**
+    q6asm/q6afe look ACDB blocks up in the kernel at stream/port start
+    (`send_afe_cal_type`, `q6asm_send_cal`); with none they log
+    `cal_block not found!!` / `cal_block is NULL` and the dsp drains the
+    buffer faster than realtime with silence on the speaker. Blocks are
+    pushed through `/dev/msm_audio_cal` by a userspace loader and are tied
+    to that process's fd, so the HAL owns the loader for the life of
+    mediaserver (the resident `acdbtest --v3 --hold` helper is the probe
+    that established it; a die-after-sending helper loses the blocks).
+  - **The loader is a newer-Android library, so it rides libhyb.**
+    `libacdbloader.so` (+ `libaudcal`, `libacdbrtac`, `libacdb-fts`,
+    `libadiertac`, `libmiscta`, `libdiag`, the vendor `libtinyalsa`) is
+    staged by `tools/libhyb/stage.py` (`ACDB` roots) exactly like the
+    Adreno driver, and `audio_hw.c` calls `acdb_loader_init_v2(card, NULL,
+    0)` + `acdb_loader_send_audio_cal_v3(15, 1, 69936, 48000, 0)` before
+    the route and `pcm_open` (`acdb_stream_cal()`; app type 69936 =
+    qualcomm's `DEFAULT_APP_TYPE_RX_PATH`, acdb id 15 = speaker from the
+    vendor `audio_platform_info.xml`).
+  - **`hw_platform` picks the acdbdata directory.** The loader builds
+    `/vendor/etc/acdbdata/<hw_platform>/` from
+    `/sys/devices/soc0/hw_platform`, which reads **MTP** on maple, while
+    the Lineage yoshino tree ships its data under `Sony/`. Staging it as
+    `Sony/` leaves the loader without a workspace file; `stage.py` copies
+    `vendor/etc/acdbdata/Sony` → `acdbdata/MTP` and `full_maple.mk`
+    installs it to `/system/vendor/etc/acdbdata/MTP` (8 files: 7 `.acdb` +
+    `workspaceFile_Sony_yoshino.qwsp`). The vendor tree's own `MTP/`
+    directory holds a different (tavil-era) calibration — the yoshino
+    (`Sony/`) set is the right one for this tasha codec, staged under the
+    `MTP` name.
+  - **`/dev/msm_audio_cal` is `root:root 0600` and mediaserver is uid
+    `media`.** The loader's open() failed EACCES and the failure surfaced
+    later and indirectly, as `ADIE RTAC INIT` →
+    `allocate_cal_block failed!` → `Cannot allocate memory!` → init
+    `-ENOMEM`. Fix in `ueventd.maple.rc`: `0660 media audio` (verified:
+    `crw-rw---- media audio /dev/msm_audio_cal`). Stock uses the same
+    group rule.
+  - **mediaserver opens the HAL before the card probes.** `adev_open()` runs
+    at ~5 s; the tasha card registers at ~8 s (the adsp boots first), so
+    the old code cached `card_name = "tavil"` and a NULL mixer forever —
+    `speaker_path(NULL)` was a no-op, `pcm_open` on the by-then-present
+    card 0 still succeeded, and playback was silent with a *running* PCM.
+    `ensure_card()` now re-detects and opens the mixer on first stream, and
+    `acdb_ensure()` only initializes the loader once the card is up
+    (initializing earlier dies in ADIE RTAC init with `-ENOMEM`).
+  - **KitKat's tinyalsa `pcm_write()` / `pcm_read()` take BYTES, not
+    frames.** `external/tinyalsa/pcm.c` divides the count by the frame size
+    itself, so `pcm_write(pcm, buffer, frames)` wrote only 1024 of every
+    4096 bytes AudioFlinger handed over — the dsp got a chopped signal and
+    the speaker stayed silent. Dynamic debug showed it directly:
+    `msm_pcm_playback_copy:fbytes =1024: xfer=1024 size=4096` for the HAL
+    vs `=2048: xfer=2048` for `tone_test`. Fix: pass `bytes` on both paths
+    (`out_write` and `in_read`), and the same in `tools/tone_test.c`.
+  - **Debug method that worked.** debugfs is **not** mounted at boot
+    (`/d` is a dangling symlink to `/sys/kernel/debug`); `mount -t debugfs
+    none /d` then gives `dynamic_debug/control`, and
+    `echo "file msm-pcm-q6-v2.c +p" > control` (also `q6asm.c`, `q6adm.c`,
+    `q6afe.c`, `msm-pcm-routing-v2.c`) traces every buffer/cal step in
+    dmesg. That is what proved the HAL was writing (it was) and the cal was
+    arriving (it was) — the count/unit bug was underneath.
+  - **Runner tools.** `acdbtest` (`devices/maple/kitkat/hyb/`, libhyb;
+    `--init-only`, `--send ID TYPE`, `--v3 --hold 15 1`) proved loader +
+    paths + the fd-lifetime rule before the HAL owned calibration.
+    `audiotrack_test` (`devices/maple/kitkat/audio/`, in the image) drives
+    AudioTrack → AudioFlinger → HAL, the only path that exercises the HAL's
+    own stream handling; `tools/tone_test` talks to tinyalsa directly and
+    stays the low-level route/capture tool.
+  - **Two adjacent fixes.** `adsp_boot` gained `oneshot`: without it init
+    restarted the script every ~5 s and every run re-wrote
+    `/sys/kernel/boot_adsp/boot` (`adsp_loader_do: scheduling work to load
+    ADSP fw` spam, and a reload tramples live streams); after the fix,
+    `dmesg | grep -c "boot_adsp write returned"` = 1 per boot. And
+    `full_maple.mk` inherits `frameworks/base/data/sounds/AllAudio.mk` —
+    the image had no `/system/media/audio` at all, so there were no
+    ringtones or UI effects.
+  - **Still open.** Capture calibration (DEC7 dmic route runs
+    uncalibrated — TX calibration is accepted by the loader but kills the
+    ADM, see TEST 51; TX app type 69937 / `Audio Stream Capture 0 App
+    Type Cfg` is wired but disabled by `MAPLE_TX_CAL`); BT SCO stays
+    known-dead (CHARQUIRKS). UI key clicks were silent for an unrelated
+    reason — no `media_codecs.xml`, so SoundPool could not decode
+    `Effect_Tick.ogg` — fixed and verified in TEST 52 (a hardware volume
+    key plays nothing in AOSP KitKat at all; the touch path is the one
+    that plays a sound effect).
+
+## Bringup log: audio — framework capture, routing, TX calibration (2026-10-19)
+
+- **TEST 51 (owner: audio parity with
+  [DoomGuy41/Taimen-KitKat](https://github.com/DoomGuy41/Taimen-KitKat);
+  2026-10-19):** **capture through the framework works, the headphone
+  route + its calibration work, and TX (capture) calibration is
+  deliberately off.** `audiorecord_test` (new: AudioRecord →
+  AudioFlinger → `audio.primary.maple`) records the 440 Hz tone that
+  `audiotrack_test` plays through the same HAL: dominant frequency
+  **440.00 Hz** over 5.97 s, per-second `rms` 92–94 (peak 199–299), no
+  `cal_block` and no `adm_callback` errors. Solo capture of a quiet room
+  reads peaks 85–174 / rms 20–32. Verified on the flashed images
+  (boot.img `0b0e750db3d6b6381d1e17f95e89af8c`, sparse system.img
+  `9d11eb2cb5a5036f6d74413e9b7c59d5`, TWRP raw readback
+  `41f30fb19692367aab5f265ba00e3849`; TWRP md5s matched. The same checks
+  passed on the intermediate system `5ff353b7b6c5b3d5e2892cef76022553`).
+  - **`ACDB_DEV_TYPE_IN` is 2, not 0.** The magic 0 came from nowhere —
+    `hardware/qcom/audio/hal/audio_hw.h` (the KitKat qcom HAL in this
+    tree) defines `ACDB_DEV_TYPE_OUT 1` / `ACDB_DEV_TYPE_IN 2`. With 0 the
+    Android 15 loader logs `ACDB -> Device is not RX or TX!acdb_id = 4` and
+    `acdb_loader_send_audio_cal_v3` returns non-zero — 65 for that fresh
+    first id, 66/67 for others, and 66 for an id that already went
+    through with dev_type 2. With 2 the same call returns 0 and
+    the log shows `send_audio_cal, acdb_id = 4, path = 1, app id =
+    0x11131, sample rate = 48000` → `GET_AFE_TOPOLOGY_ID for adcd_id 4,
+    Topology Id 112fb` → `send_hw_delay : acdb_id = 4 path = 1`.
+  - **…but that TX calibration makes every capture prepare fail.** The
+    next `pcm_open(PCM_IN)` + prepare dies: when the HAL itself sent the
+    cal it is the ADM that gives up (`adm_callback: cmd = 0x10326
+    returned error = 0x1`,
+    `msm_pcm_routing_reg_phy_stream: adm open failed copp_idx:-131`,
+    `msm_pcm_capture_prepare: stream reg failed ret:-22`,
+    `msm-pcm-dsp … ASoC: platform prepare error: -22`); when only
+    `acdbtest --scan` sent it (no capture app-type cfg, HAL never opened
+    a capture) the SLIM TX backend fails instead
+    (`msm-dai-q6-sb-0-tx: ASoC: cpu DAI prepare error: -131`,
+    `SLIMBUS_0_TX: ASoC: backend prepare failed -131`). Either way
+    `AudioRecord` never gets data (the record hangs) and a plain
+    `tone_test cap` fails identically, so it is the cal blocks, not the
+    HAL; and they are **not** freed by `kill -9 mediaserver` — capture
+    stays dead until reboot (verified twice).
+    `audio_hw.c` therefore has `MAPLE_TX_CAL 0` with these logs in the
+    comment: capture runs uncalibrated (and works), the RX side is
+    unaffected (acdb 15/10 both carry topology `112fc`). Repro on a
+    scratch boot if you touch it: one `audiorecord_test` after enabling
+    TX cal, or one `acdbtest --scan`, is enough to poison capture for
+    that boot.
+  - **The loader's RX/TX device table is a hardcoded list.** New
+    `acdbtest --scan` (one loader init, then a batch of ids, documented
+    in the tool's own comment) on a fresh boot of the final image:
+    RX 15 (speaker), 10 (headphones), 799 (speaker+headphones) → all
+    return 0; TX 4 (handset mic), **8 (headset mic)**, 9, 6, 35, 131,
+    143, 152 → all return 0 with `dev_type=2`. `dev_type=0` (what the
+    port first sent) is rejected — `ACDB -> Device is not RX or TX!acdb_id
+    = %d` in the log, return 65/66/67 depending on the id and order.
+    **The scan's TX sends load real blocks, so they poison capture for
+    the rest of that boot** (the -131 SLIM TX failure above; playback is
+    unaffected) — run it last. Also **run the scan on a fresh boot,
+    before the first framework stream**: once mediaserver has
+    initialized the loader, a second `acdb_loader_init_v2` dies in
+    `cal_block_ion_alloc: audio ION import failed, rc = -22` →
+    `voice_alloc_cal … failed` → init `-12` (the first process keeps the
+    cal blocks, and they outlive it).
+  - **`routing=` is a signed int, and the policy re-sends it at
+    startInput.** `AudioPolicyManagerBase.cpp` uses
+    `param.addInt(String8(AudioParameter::keyRouting), (int)newDevice)`
+    (lines 235/476/1022), so input devices arrive as negative decimals
+    (0x80000004 → -2147483644) and must be parsed with
+    `str_parms_get_int` + a cast back to `uint32_t` (a `%u` sender
+    overflows to `0x7fffffff` — verified the hard way). The HAL now picks
+    the route from that value at stream open: speaker (acdb 15) or
+    headphones (acdb 10); builtin mic (4) or headset mic (8). RX ids come
+    from the vendor `audio_platform_info.xml`/`platform.c` table, TX ids
+    from `hardware/qcom/audio/hal/msm8974/platform.c`'s
+    `acdb_device_table[]` (`IN_HANDSET_MIC 4`, `IN_HEADSET_MIC 8` —
+    headset mic is **8**, not the 9 guessed from the 8974-era table).
+  - **`route out 0x8 -> headset (acdb 10)` verified.** `audiotrack_test 3
+    48000 0.5 8` sends `routing=8` through
+    `AudioSystem::setParameters(0, …)` the way the policy does on a jack
+    insert; the HAL logs the headset choice, applies the vendor
+    `headphones` path (RX INT1/RX2, `CLSH_DSM_OUT`, RX1/RX2 volume 76),
+    sends cal 10 (`Topology Id 112fc`), prepares and plays — no ADM
+    errors. Audibility still needs headphones on the owner's end
+    (nothing plugged = no load). The route only re-applies when the HAL
+    stream opens, so the test needs the previous output to go to standby
+    (~3 s); a second track started immediately reuses the running stream
+    and keeps the old route (observed).
+  - **No `h2w` switch exists, so the jack never routes itself.**
+    `/sys/class/switch/` holds `hdmi hdmi_audio lid sim_detect wfd`
+    only. KitKat's `WiredAccessoryManager` watches
+    `/sys/class/switch/h2w/state`, so nothing ever sends `routing=4/8`
+    on its own, and an app cannot force the *input* device either: the
+    policy re-sends its own input routing at `startInput`
+    (`dev routing=0x80000010 (in)` immediately followed by
+    `in routing=0x80000004` → builtin mic). The `headset-mic` path
+    (`adc2` → DEC0 → SLIM TX0) is written and compiles into the route
+    switch but is **unexercised** — verify-me once the kernel exposes a
+    jack source (wcd-mbhc switch/extcon bridge).
+  - **Runner tools.** `audiorecord_test [seconds] [rate] [file]
+    [routing]` is the capture sibling of `audiotrack_test` (raw S16_LE
+    mono + per-second peak/rms, routing optional); `audiotrack_test
+    [seconds] [rate] [volume] [routing]` gained the routing argument;
+    both are in the image and set the routing *after* constructing the
+    track/record (openOutput/openInput would otherwise overwrite it) and
+    *before* start/write (the HAL opens the PCM lazily on the first
+    buffer). Loopback recipe:
+    `adb shell 'audiotrack_test 8 48000 0.8 & sleep 1; audiorecord_test 6 48000 /data/local/tmp/loop.raw; wait'`
+    then `python3 scripts/analyze-rec.py loop.raw` on the host after pulling
+    it (raw S16_LE mono, 5.97 s → 440.00 Hz / rms 92–94 above).
+
+
+## Bringup log: media decode — the missing media_codecs.xml (2026-10-19)
+
+- **TEST 52 (owner: media parity — stock plays decoded audio, this port
+  did not; 2026-10-19):** **every compressed media format was silent
+  while raw PCM played: the image had no
+  `/system/etc/media_codecs.xml`.** Found while chasing the UI click
+  (a nav-bar tap): the click path itself is correct (`KeyButtonView` →
+  `AudioManager.playSoundEffect` → AudioService's SoundPool), but
+  SoundPool reported `Unable to load sample: (null)` and
+  `onLoadSoundEffects(), Error -22 while loading samples`; Music's
+  AudioPreview on the same kind of ogg ringtone reported
+  `MediaPlayer: error (1, -2147483648)` = `MEDIA_ERROR_UNKNOWN` +
+  `UNKNOWN_ERROR` (0x80000000, `utils/Errors.h`). (Hardware volume keys
+  play no sound in AOSP KitKat — the old "volume-key click not
+  observed" note was a red herring; the touch path is the one to test.)
+  - **Why raw worked and compressed did not.**
+    `AwesomePlayer::initAudioDecoder` bypasses OMX for `audio/raw`
+    (`mAudioSource = mAudioTrack`), so WAV (WAVExtractor → audio/raw)
+    played normally — the HAL opened for it (`route out 0x2 -> speaker
+    (acdb 15)`, cal loaded), which is also why the earlier "speaker
+    playback works" checks passed. ogg/mp3 need `OMXCodec::Create`; it
+    returned NULL for every compressed MIME.
+  - **Root cause.** This 4.4.4 tree's `OMXCodec::findMatchingCodecs`
+    asks `MediaCodecList`, which `fopen`s **`/etc/media_codecs.xml`**
+    (`frameworks/av/media/libstagefright/MediaCodecList.cpp`). If the
+    file is missing it logs `MediaCodecList: unable to open media codecs
+    configuration xml file.` (ALOGW — the only line that reached dmesg)
+    and `initCheck()` stays `NO_INIT`, so `getInstance()` returns NULL;
+    `findMatchingCodecs` leaves the vector empty and `OMXCodec::Create`
+    returns NULL with `No matching codecs!` logged at **ALOGV** — which
+    `-DNDEBUG` compiles out, so the failure is silent at default log
+    level. Our image had no `/system/etc/media_codecs.xml`: AOSP ships
+    one only for goldfish/sdk
+    (`device/generic/goldfish/camera/media_codecs.xml`, pulled in by
+    `sdk.mk`), and `full_maple.mk` wrongly assumed it "ships with the
+    stock build".
+  - **The two error codes are the same failure at two layers.** Music's
+    MediaPlayer surfaces `initAudioDecoder` → `UNKNOWN_ERROR` (log
+    `error (1, -2147483648)`); SoundPool's decode goes through
+    `MediaPlayerService::decode` → `AudioCache::notify` records
+    `MEDIA_ERROR`/`UNKNOWN_ERROR`, `cache->wait()` then fails and decode
+    returns `BAD_VALUE` (-22) — hence `Error -22` from AudioService while
+    the same dmesg window shows `AudioCache: Error 1, -2147483648
+    occurred`.
+  - **Fix.** New `devices/maple/kitkat/media/media_codecs.xml` lists the
+    `OMX.google.*` components that `SoftOMXPlugin` provides and this
+    image builds (17 `libstagefright_soft_*.so`; the soft MPEG4 library
+    supplies both `mpeg4` and `h263`, `vpxdec` supplies vp8+vp9; the raw
+    decoder is not listed because `MediaCodecList` adds it itself).
+    `full_maple.mk` installs it as `/system/etc/media_codecs.xml`
+    (`/etc` is the usual symlink to `/system/etc`, checked on-device).
+  - **Verified on the flashed image (2026-10-19).** boot.img
+    `0b0e750db3d6b6381d1e17f95e89af8c`, sparse system
+    `f8ab40bee62442f96b55f5cecb369061`, TWRP raw readback
+    `ab879f3b082338fc838d1818055d3536` (TWRP reported `ALL VERIFIED`).
+    - **MP3:** Music's `AudioPreview` on `file:///sdcard/test440.mp3`
+      (an ffmpeg 440 Hz sine) → HAL `route out 0x2 -> speaker (acdb
+      15)`, topology `112fc`, no `MediaPlayer: error`; the DMIC loopback
+      of it (`audiorecord_test 5 48000`, analysed with
+      `scripts/analyze-rec.py`) reads **440.00 Hz** over 0.00–2.25 s
+      (rms 48.9→18.9).
+    - **OGG:** `ANDROMEDA.ogg` from `/system/media/audio/ringtones`
+      through the same AudioPreview → same route/cal, no error.
+    - **UI click:** a nav-bar tap in Settings now opens a HAL stream
+      (`route out 0x2 -> speaker (acdb 15)`) and logs neither
+      `SoundPool: Unable to load sample` nor `onLoadSoundEffects(),
+      Error -22` (both were the pre-fix symptom).
+    - **Video (same fix).** Gallery `MovieActivity` on
+      `file:///sdcard/testvid10.mp4` (ffmpeg `testsrc` 320×240, h264
+      Baseline + 880 Hz AAC) → `OMXCodec: [OMX.google.h264.decoder] AVC
+      profile = 66 (Baseline), level = 12 / video dimensions are 320 x
+      240`, `SoftAAC2: Reconfiguring decoder: 0->44100 Hz`, `MediaPlayer:
+      info/warning (3, 0)` (= MEDIA_INFO_VIDEO_RENDERING_START), HAL
+      `route out 0x2 -> speaker (acdb 15)` + cal 15/`112fc`. A screenshot
+      taken mid-playback shows the testsrc pattern (colour bars + circle)
+      scaled full-screen to 1080×1920 with letterboxing, and the DMIC
+      loopback of the track reads **880.00 Hz** (rms 182) — so the
+      software h264 decoder, the GL composition path and the audio track
+      all work together.
+    - `ACDB_CMD_GET_AFE_COMMON_TABLE_SIZE` / `ACDB AFE returned = -19`
+      with `Failed to fetch the lookup information of the device
+      0000000F` is **benign** here: the loader logs it on every speaker
+      cal send and continues with `AUDIO_SET_AFE_CAL` — the successful
+      video run shows the same pair (the yoshino MTP acdbdata has no AFE
+      common table for dev 15; the AFE cal that is applied is the
+      topology/`send_afe_cal` one, and the sound loops back at full
+      level).
+    - The first flash attempt aborted mid-way when TWRP dropped off USB
+      for ~10 minutes; the battery read 100 % when TWRP came back, so
+      that was a TWRP/USB crash, not a low battery. The second run
+      flashed and verified cleanly.
+  - **Port implication.** The "speaker audio" status the port carried
+    was *raw-PCM-only*: ringtones, notification/alarm sounds, UI clicks
+    and music (all ogg/mp3 in KitKat) could never play. The same missing
+    file also disabled *video* decode (no h264/vpx components), so the
+    port could not play video either; with the XML shipped, both are
+    verified (above). A KitKat port that has no OEM codec list must
+    supply its own.

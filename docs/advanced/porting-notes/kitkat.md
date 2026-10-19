@@ -2,13 +2,15 @@
 
 Playbook for bringing AOSP KitKat (`android-4.4.4_r2`, KTU84Q, API 19) up
 on post-2014 hardware. Started for the Sony Xperia XZ Premium (`maple`,
-2017, MSM8998); device quirks (incl. the TEST 1–37 bringup log) live in
+2017, MSM8998); device quirks (incl. the TEST 1–49 bringup log) live in
 the [maple quirks](../../devices/maple/quirks.md), the step-by-step build
 in [build/kitkat.md](../build/kitkat.md). The [Donut playbook](donut.md)
 is the method reference — this doc is the KitKat delta. Back to the
 [advanced index](../README.md).
 **Everything below the "Field lessons" header is boot-verified on maple
-(Oct 2026); treat the sections above it as the original checklist.**
+(Oct 2026) except the [libhyb section](#libhyb-lessons-maple-2026-10-18-built-on-device-verification-pending),
+which was built 2026-10-18 and awaits its first flash; treat the sections
+above it as the original checklist.**
 
 ## Field lessons (maple, verified on-device)
 
@@ -43,9 +45,15 @@ is the method reference — this doc is the KitKat delta. Back to the
 - **`write /dev/kmsg` from init is unobservable** on kernels without
   matching policy/context (no error). Diagnose with file outputs
   (`dmesg > /data/...`, per-pid `/proc` snapshots) pulled via TWRP, not
-  kmsg markers. Related: the 4.4 kernel has no `CONFIG_LOGGER`, so
-  logcat is blind and every ALOG failure is invisible — including the
-  errno fallout that once sent us chasing a phantom EBADF.
+  kmsg markers. Related: the 4.4 kernel has no `CONFIG_LOGGER`, so there
+  is no `/dev/log` and stock logcat is blind. Patch liblog to fall back
+  to `/dev/kmsg` (`patches/kitkat/system-core-liblog-kmsg-*.patch`) and
+  every `ALOG*` becomes a `<level>Tag[pid]: msg` line in `dmesg` — it
+  also means the *newer* 32-bit libraries loaded by
+  [libhyb](../../advanced/software/libhyb.md) log through the old
+  liblog, so their messages land in `dmesg` too. Watch the errno fallout
+  that once sent us chasing a phantom EBADF (journal-file helpers lie by
+  omission).
 - **First-boot services to disable** (cooper pattern — all TEMPORARY,
   re-enable with the real fix): `vold` if it parks in decrypt-wait on
   foreign userdata (re-enable: ours runs fine once userdata is ext4);
@@ -67,34 +75,57 @@ is the method reference — this doc is the KitKat delta. Back to the
   "Junk in the top half of 64-bit unions breaks lookups" — assign every
   field, leave no padding uninitialised.
 - **EGL needs a driver it isn't allowed to skip**: KitKat's loader skips
-  `libGLES_android.so`, aborting surfaceflinger in `eglGetDisplay` when
-  no HW driver exists. Our `frameworks-native-egl-glrenderd.patch`
-  routes EGL to the emulation libs when glrenderd answers, libagl
-  otherwise. Know the limits of the fallback: **libagl is ES1-only** —
-  any ES2 client (live wallpaper, hwui apps) finds no matching config
-  and dies (`eglConfig not initialized`). Bring a real ES2 path (our
-  glrenderd/Adreno route does — ES 3.2) and keep a non-GL fallback for
-  when it's absent (the wallpaper canvas path when EGL init throws).
-- **Two flippers wedge mdss**: exactly one thing may
-  `FBIOPAN_DISPLAY`-flip fb0. The trap is "mixed mode": start the second
-  flipper (glrenderd) *after* surfaceflinger has already run its EGL
-  emulation probe and SF is latched to the software renderer — the
-  decision is cached per process, so SF pans fb0 AND glrenderd pans →
-  desynced `yoffset`, `mdp ctl start failed` (EBUSY), panel frozen on the
-  splash. Fix is ordering, not arbitration: start glrenderd in
-  `post-fs-data`, before SF's first probe, so SF finds the socket and
-  takes the emulation path (posts via `rcFBPost`, never `FBIOPAN`s) and
-  glrenderd is the single flipper.
-- **Size the renderer-probe window to real startup latency**: the
-  egl + gralloc "is glrenderd there?" probes wait for the abstract
-  socket. glrenderd's cold-boot startup (adreno init + firmware load) is
-  slow; a 5s window missed it, SF fell back to software and never
-  reconsiders for the process lifetime. Wait generously (we use 300 ×
-  100 ms). Corollary: keep the daemon's own startup fast — a
-  "wait for the fb HAL to double-buffer, then do it ourselves" made bind
-  take 10s instead of 0.2s; nobody opens the fb HAL in glrenderd mode,
-  so just double `yres_virtual` immediately (`FBIOPUT_VSCREENINFO`) or
-  the daemon samples `flips=0` and memcpys without ever panning.
+  `libGLES_android.so` ("always skip the software renderer") and aborts
+  surfaceflinger in `eglGetDisplay` when no other driver exists. Know the
+  limits of the fallback: **libagl is ES1-only** — any ES2 client (live
+  wallpaper, hwui apps) finds no matching config and dies (`eglConfig not
+  initialized`). Bring a real ES2 path and keep a non-GL fallback for when
+  it's absent (the wallpaper canvas path when EGL init throws, plus the
+  Atlas backport below).
+- **On KitKat the EGL driver is chosen by readdir, not by `egl.cfg`**:
+  `Loader::MatchFile::find()` scans `/vendor/lib/egl` then
+  `/system/lib/egl` for `libEGL_*.so` and takes **the first hit**
+  (verified in the server tree's `Loader.cpp`, ~lines 265–350); `egl.cfg`
+  is inert at runtime on this release (it only documents the layout).
+  That makes a *leftover* `libEGL_emulation.so` an unpredictable winner
+  and the choice one-shot: SF latches it per process, so a bad pick means
+  software GL until SF restarts. Make the probe deterministic (build
+  exactly one hardware `libEGL_*.so`, delete stale emulator libs from the
+  out tree) instead of trying to win a race. **Never set
+  `ro.kernel.qemu`** — its presence short-circuits the same loader to
+  `libGLES_android.so` and disables hwui.
+- **A retired transport leaves workarounds behind**: the in-process
+  [libhyb](../../advanced/software/libhyb.md) design (maple 2026-10-18)
+  deleted the glrenderd socket, and with it the bounded-reply/reconnect/
+  socket-buffer machinery, the readback presenter and the EGL loader
+  patch — GL calls are plain function calls now. When you change a
+  transport, sweep the workarounds it justified (they will still "work",
+  which is how they survive): grep the patch set and init scripts for the
+  old component's name before calling the migration done.
+- **Two flippers wedge mdss**: exactly one thing may drive fb0's offset.
+  The trap is "mixed mode": a second flipper competing with surfaceflinger
+  after SF has already picked its renderer (the choice is cached per
+  process) — both flip, `yoffset` goes out of sync and mdss logs
+  `mdp ctl start failed` (EBUSY) with the panel frozen on the splash. Fix
+  is ordering, not arbitration: the component that owns the fb HAL must be
+  the only flipper. In the libhyb design `gralloc.maple` owns the fb HAL
+  (SurfaceFlinger posts through it and never `FBIOPAN`s) and `fbpresentd`
+  is started in `post-fs-data`, before SF's first post; the old
+  glrenderd design instead had to start its daemon before SF's first EGL
+  probe.
+- **The glrenderd-era socket lessons (this bullet and the
+  readback/socket cluster further down) are retired on maple but still
+  live on poplar and documented here as the template for a
+  socket-transport GL bridge**: size every "is the renderer there?"
+  probe to real startup latency. glrenderd's cold-boot startup (adreno
+  init + firmware load) is slow; a 5s window missed it, SF fell back to
+  software and never reconsiders for the process lifetime. Wait
+  generously (we used 300 × 100 ms). Corollary: keep the daemon's own
+  startup fast — a "wait for the fb HAL to double-buffer, then do it
+  ourselves" made bind take 10s instead of 0.2s; nobody opens the fb HAL
+  in glrenderd mode, so just double `yres_virtual` immediately
+  (`FBIOPUT_VSCREENINFO`) or the daemon samples `flips=0` and memcpys
+  without ever panning.
 - **Flip with the ioctl the working path uses, not the "obvious" one**: on
   maple `FBIOPAN_DISPLAY` returns success but `mdss_mdp_overlay_pan_display`
   logs `unable to allocate base pipe` and never moves `yoffset` — the panel
@@ -255,14 +286,17 @@ is the method reference — this doc is the KitKat delta. Back to the
   panel takes effect, the other is inert. Verify brightness with
   `settings put system screen_brightness N` + reading both nodes while the
   screen is ON (`mScreenOn=true`; a sleeping screen reads 0 by design).
-- **Renderer rebuilds are safe when the protocol files are untouched**:
-  the "never rebuild glrenderd alone" rule is about `*_enc`/`*_dec` codec
+- **Renderer rebuilds are safe when the protocol files are untouched**
+  (glrenderd era, kept for poplar/leftover references): the "never
+  rebuild glrenderd alone" rule is about `*_enc`/`*_dec` codec
   tables generated from the `.in` files — if those are unchanged, the
   regenerated tables are identical and the deployed guest `*_enc.so`
   matches (maple TEST 33 rebuilt glrenderd from the same tree; panel came
   up correct). Keep the known-good binary as the backup either way.
 - **The post readback is the per-frame cost floor on a framebuffer-backed
-  renderer** (maple TEST 35): with the guest composing on the host GPU and
+  renderer** (maple TEST 35; the design libhyb replaced — retired on
+  maple, still the shape of poplar's glrenderd): with the guest
+  composing on the host GPU and
   the panel fed from fb0, every presented frame pays a synchronous
   `glReadPixels` (~9–10 ms at 1080p) plus a copy into the presenter.
   Bounce the readback straight into the presenter's staging slot (poplar's
@@ -314,11 +348,15 @@ is the method reference — this doc is the KitKat delta. Back to the
   on-partition, `adb reboot` straight after.)
 - **Check QRTR in kallsyms before planning any QMI userspace** (maple
   TEST 37): `grep -c qrtr /proc/kallsyms` with positive controls
-  (`binder`, `msm_ipc_router` must hit) — 0 means no modern QMI daemon
-  (cnss-daemon, pd-mapper, rmt_storage, tftp_server) can ever run,
-  chroot or not. Legacy IPC_ROUTER (`msm_ipc_router` thread,
-  `sysmon-qmi` reaching ADSP SSCTL) and SMD FastRPC
-  (`/dev/adsprpc-smd`) do work — constrain daemon designs to those.
+  (`binder`, `msm_ipc_router` must hit). 0 means anything linking
+  `libqrtr.so` directly cannot run (maple: `tftp_server`, `qrtr-ns`)
+  — but check the client library first: the vendor's `libqmi_cci` /
+  `libqmi_csi` are dual-transport (`qcci_`/`qcsi_ipc_router_ops` plus
+  the `qrtr_ops`, runtime probe) and fall back to the legacy IPC
+  Router, so "no modern QMI daemon can ever run, chroot or not" was
+  too strong (Taimen mapping §corrections, 2026-10-18). Legacy
+  IPC_ROUTER (`msm_ipc_router` thread, `sysmon-qmi` reaching ADSP
+  SSCTL) and SMD FastRPC (`/dev/adsprpc-smd`) provably work.
 - **Read the running kernel, not the defconfig** (maple TEST 36):
   `/proc/config.gz` is ground truth (`4.4.302-whatawurst+` has
   `CONFIG_QCA_CLD_WLAN=y` built-in and the full tavil/WSA/QDSP6 set,
@@ -350,7 +388,9 @@ is the method reference — this doc is the KitKat delta. Back to the
   `hwchroot` assembles glrenderd's chroot under `/dev/.glr` and binds the
   real entries onto it; nothing inside `<root>` is ever written.
 - **Staged binaries silently revert to whatever the staging dir holds**
-  (maple TEST 41): a rebuilt daemon was live-pushed to the device but the
+  (maple TEST 41; still the rule for `maple-hyb/` + `maple-bin/`, see
+  [libhyb](../../advanced/software/libhyb.md)): a rebuilt daemon was
+  live-pushed to the device but the
   staging dir was never refreshed, so the next system image shipped the old
   binary beside the new guest libs — a cross-build protocol mismatch that
   crashed the daemon ~3x in 5 min (FORTIFY destroyed-mutex, SIGSEGV in
@@ -367,12 +407,13 @@ is the method reference — this doc is the KitKat delta. Back to the
   triggers (4.4 init has no state notifications), so a component that must
   react to another service's restart needs an in-band marker file.
 - **Init triggers do not wait for the services they start** (maple
-  TEST 41): `start glrenderd` in post-fs-data returns once the process is
-  forked, and init proceeds to the next trigger (`on boot` →
+  TEST 41): `start fbpresentd` (or any service) in post-fs-data returns
+  once the process is forked, and init proceeds to the next trigger
+  (`on boot` →
   `class_start core`) immediately — surfaceflinger's process appeared
-  milliseconds behind glrenderd's at maple's boot (caught by a probe that
-  wrongly assumed "SF running" meant "the daemon restarted"). Never infer
-  service states from process presence during early triggers.
+  milliseconds behind the started service's at maple's boot (caught by a
+  probe that wrongly assumed "SF running" meant "the daemon restarted").
+  Never infer service states from process presence during early triggers.
 - **Cross-era property writes exec the host's `setprop`** (maple TEST 41):
   a helper built static with a modern NDK still runs on the old release,
   but its property client expects the post-8.x `/dev/__properties__`
@@ -380,6 +421,362 @@ is the method reference — this doc is the KitKat delta. Back to the
   host's `/system/bin/setprop` for `ctl.restart` instead (verified on
   device). Same trick applies to any modern-side helper that must poke an
   ancient release's init.
+
+## libhyb lessons (maple, verified on hardware 2026-10-19)
+
+The in-process replacement for glrenderd — Adreno 540 driver + QTI
+gralloc1 from a Lineage 22.1 closure loaded into KitKat processes. Full
+write-up: [libhyb](../software/libhyb.md); adoption notes (which Taimen
+patches were taken, skipped or queued):
+[taimen-kitkat-mapping.md](../taimen-kitkat-mapping.md); device log:
+[maple quirks](../../devices/maple/quirks.md) TEST 49. The reusable
+lessons:
+
+- **A newer 32-bit vendor driver can be called in-process on an old
+  Android.** The C-level EGL/GLES ABI is stable across the gap; what
+  needs bridging is (a) bionic symbols the newer libraries import and
+  (b) buffer formats. Ship a loader + a hooks table and the driver's real
+  entry points are plain function calls — no socket, no readback, no
+  chroot, and the "one flipper" problem collapses to "the gralloc HAL
+  owns fb0".
+- **Decide the old/new boundary name by name.** The loader resolves a
+  fixed host list (`libc`, `libm`, `libdl`, `liblog`, `libcutils`,
+  `libz`) to the old system's own libraries and stages everything else
+  from the closure. That is what keeps one copy of the allocator,
+  signal handling and logging in the process — and it means the *new*
+  libraries' `ALOG*` output rides the old liblog, so an old-side logging
+  fix (the `/dev/kmsg` fallback above) lights up the driver's logs too.
+- **Discover the closure with `readelf -d` from the real roots, then add
+  a second pass for runtime `dlopen`s** (`eglSubDriverAndroid`,
+  `libq3dtools`, the gralloc module): the linker graph alone misses what
+  a HAL loads by name. Keep staging deterministic (the tools do it) and
+  print what was staged and what was rejected, or the next person
+  re-does the walk by hand.
+- **Re-derive kernel-facing constants from the target's own kernel
+  headers**, never from a sibling port's copy: the atomic-commit pipe
+  encoding (`pipe_ndx`) and the `msm_mdp*.h` struct layouts came from
+  this kernel's `include/uapi/linux/` and were then vendored into the
+  device tree so the userspace build and the kernel can't drift.
+- **A 64-bit-only kernel path needs an out-of-tree binary** — KitKat's
+  build system makes 32-bit binaries only, and the 32-bit compat path of
+  at least one MDSS ioctl is fatal (Taimen's port; verify-me on maple).
+  Build the presenter with the NDK (`-static`, aarch64) and stage it
+  under `vendor/sony/<device>-bin/` **outside the device-tree rsync
+  path**, so `sync-device-tree.sh --delete` cannot eat it.
+- **`LOGI` is not a KitKat macro.** Device-tree code fails at *link*
+  with `undefined reference to 'LOGI'` because the unexpanded name became
+  an implicit function call; use `ALOGI`/`ALOGE`
+  (`cutils/log.h` → `log/log.h`), as `hardware/` does.
+- **Removing files from `PRODUCT_*` does not remove them from the out
+  tree.** `mkuserimg.sh` packs whatever `out/target/product/<device>/system`
+  holds; a dropped `PRODUCT_COPY_FILES`/`PRODUCT_PACKAGES` entry leaves
+  the old file (root-owned, from a container build) in the image. After
+  retiring the glrenderd design the first libhyb image still shipped the
+  whole 25 MB `/system/glr/` chroot, the emulation GL libraries and
+  `/sbin/glrenderd.sh`. Delete the stale paths from the out tree (or the
+  whole `system/` dir) and rebuild the images whenever a component is
+  removed — and never trust "I deleted the patch" for what is in the
+  image (maple TEST 49).
+- **Resolve symbols in the dlopen's local group before KitKat's
+  globals.** Two camera modules can define the same global with
+  different sizes (`g_cam_log`); binding the wrong copy corrupts memory,
+  far away from the load. Taimen found the writer with a **gdbserver
+  hardware watchpoint**; our `linker.c` implements the same order
+  (hooks → local group, breadth-first from the dlopen root → loaded
+  libraries → KitKat).
+- **A load-time binary patch table is a legitimate compatibility tool
+  when it verifies itself.** Newer libbinder's
+  `ServiceManagerShim::getService` waits 5 s for every missing service
+  (each camera open); `linker.c` rewrites `movw r5, #5000` → `#0` only
+  when the four original bytes match, and logs loudly when they do not.
+  `HYB_TRACE_SYM=<symbol>` and `HYB_TRACE=1` trace resolution and hooks
+  when a closure misbehaves — port them with the loader.
+- **Modern kernels hand vendor nodes to userspace root-only, and an
+  in-process driver is not root any more.** `/dev/kgsl-3d0` and `/dev/ion`
+  come up `root:root 0600`; the chroot-era design never cared (its renderer
+  ran as root), but a `libhyb`-style driver runs inside surfaceflinger (uid
+  `system`) and in every app process: `eglInitialize` returned
+  `EGL_BAD_ALLOC` (`Adreno-GSL: open(...) failed: errno 13`, `qdgralloc:
+  Failed to open ion device`) and SurfaceFlinger aborted with KitKat's
+  generic `no suitable EGLConfig found, giving up` — note that
+  `eglChooseConfig` reports *zero* configs for *any* `eglInitialize`
+  failure, so the EGLConfig attributes are a red herring. Fix in
+  `ueventd.<device>.rc` (`0666 root root` for both nodes; a group rule
+  cannot cover app uids, and these ports run SELinux permissive, so DAC is
+  the whole story). A live `chmod 666` proves it without a reflash.
+- **A service's `ALOG*` output needs a writable `/dev/kmsg` on kernels that
+  predate logd.** Old init gives every init-started service `/dev/null` as
+  stdout/stderr and old liblog's fallback sink is `/dev/kmsg` itself — but
+  the node is `0600 root` and liblog silently points `write_to_log` at
+  `__write_to_log_null` when `open()` fails EACCES. Result: root processes
+  and zygote descendants log (they open or inherit a kmsg fd) while
+  init-started services are mute, and the missing lines look like a hang.
+  Fix with `chmod 0622 /dev/kmsg` in the ramdisk's `init.rc` (write for
+  services, read stays root — `dmesg` needs CAP_SYSLOG anyway). Verify with
+  `log -p i -t TESTTAG hi` on both sides, or run the service by hand as
+  root (`stop surfaceflinger; surfaceflinger`) to see what it would have
+  said.
+- **KitKat's init.rc puts `onrestart restart zygote` on surfaceflinger.**
+  An SF crash-loop therefore kills zygote every few seconds and the
+  framework never finishes `preloadClasses`: one graphics bug presents as a
+  zygote/preload boot loop plus an SF abort plus "no boot". Check SF first
+  when a KitKat port restarts zygote in a loop.
+- **Newer 32-bit closure libraries carry TLS relocations; an old loader
+  must implement them.** `R_ARM_TLS_DTPMOD32` (and `DTPOFF32`) against a
+  `PT_TLS` with filesz 0 (a pure `.tbss` is normal for these libraries)
+  needs a module table and a real `__tls_get_addr`; a loader that rejects
+  unknown types fails the whole `dlopen`, usually at the EGL driver. Only
+  the *first* reloc type shows in the log if the loader stops there —
+  check the closure with `readelf -r` for all of DTPMOD32/DTPOFF32/TPOFF32
+  and for `__emutls_get_address` before concluding TLS is unnecessary
+  (shapes and the implementation are in the libhyb write-up).
+- **A present path that bypasses the framebuffer makes fb0 readbacks
+  blind.** With zero-copy commits fb0's memory is never written, so a
+  dump-and-decode "is it rendering?" harness sees an all-zero frame on a
+  perfectly driven panel; keep (or build) a copy fallback for verification
+  and use it for the geometry check (stride, shear), while the live check
+  is the presenter's fence/rate log.
+
+## Audio (ACDB) lessons (maple, verified on hardware 2026-10-19)
+
+Qualcomm's kernel audio drivers (q6asm/q6afe/q6adm) are **calibration
+consumers**: at stream/port start they look up ACDB blocks that a userspace
+loader pushed into `/dev/msm_audio_cal`. On a port whose old userspace has
+no loader, the block lookup fails (`send_afe_cal_type: cal_block not
+found!!`, `q6asm_send_cal: cal_block is NULL`) and playback is silent with
+a *running* PCM — the dsp just drains the buffer faster than realtime.
+The loader (`libacdbloader.so`) is an Android-15-vintage library, so the
+same in-process trick as the GPU driver applies. Field log: maple quirks
+TEST 50; the HAL is
+[`devices/maple/kitkat/audio/audio_hw.c`](../../../devices/maple/kitkat/audio/audio_hw.c).
+
+- **The cal blocks are owned by the loader's fd.** They appear when the
+  loader opens `/dev/msm_audio_cal` and vanish when it exits, so a
+  fire-and-forget helper is not enough — whatever loads them must stay
+  resident (the HAL keeps the handle for the life of mediaserver). A
+  resident test helper (`acdbtest --v3 --hold`) is how to prove the
+  lifetime rule before wiring it into a HAL.
+- **The in-kernel contract is the app-type cfg control.** Before routing,
+  the HAL sets `Audio Stream 0 App Type Cfg` to `[app_type, acdb_id,
+  sample_rate]` (KitKat's `mixer_ctl_set_array` supports the INTEGER
+  array; the control has 128 slots and the write zeroes the rest, which
+  matches the stock 3-value form) and then asks the loader for the
+  matching blocks: `acdb_loader_send_audio_cal_v3(acdb_id, dev_type=1,
+  app_type, rate, 0)`. Order matters: cfg → cal → route → `pcm_open`,
+  because the afe-cal is applied when the backend port is enabled and the
+  asm-cal when the PCM opens.
+- **`hw_platform` selects the acdbdata directory, and the name is not
+  cosmetic.** The loader builds `/vendor/etc/acdbdata/<hw_platform>/`
+  (workspace file + top-level `.acdb`) from `/sys/devices/soc0/hw_platform`
+  — "MTP" on maple — while upstream trees often ship the files under a
+  form-factor or OEM directory (`Sony/` for yoshino). Stage the data under
+  the name the device actually reports, or the loader initializes with no
+  workspace and the calibration is empty.
+- **The node is root-only by default; a group rule is required.** The
+  driver creates `/dev/msm_audio_cal` `root:root 0600`, and the loader
+  runs inside mediaserver (uid `media`). The EACCES is silent at open()
+  time and only surfaces later as an unrelated-looking init failure
+  (`ADIE RTAC INIT` → `allocate_cal_block failed!` → `Cannot allocate
+  memory!` → `-ENOMEM`), so check DAC before suspecting the data.
+  `ueventd.<device>.rc`: `0660 media audio`.
+- **Initialize the loader only once the sound card is up.** mediaserver
+  opens the HAL seconds before the dsp has booted, so the card is not in
+  `/proc/asound/cards` yet: cache nothing at open time (a NULL mixer
+  cached there makes the route a no-op while `pcm_open` still succeeds on
+  the later card), and defer the loader init too — initializing with no
+  codec ends in ADIE RTAC init `-ENOMEM`. Re-detect and open on first
+  stream.
+- **KitKat's tinyalsa `pcm_write`/`pcm_read` take BYTES, not frames.**
+  (`external/tinyalsa/pcm.c` divides the count by the frame size itself.)
+  Passing frames writes a quarter of every stereo 16-bit buffer, drops the
+  rest, and the dsp renders a chopped signal that can read as "silence with
+  a running PCM". The same API is `pcm_writei`-style frames in other
+  tinyalsa copies, so read the tree's own `pcm.c` before porting a HAL.
+- **Dynamic debug separates userspace from dsp.** Mount debugfs by hand on
+  these ports (`/d` is a symlink to `/sys/kernel/debug` but nothing mounts
+  it: `mount -t debugfs none /d`), then
+  `echo "file msm-pcm-q6-v2.c +p" > /sys/kernel/debug/dynamic_debug/control`
+  (plus `q6asm.c`, `q6adm.c`, `q6afe.c`, `msm-pcm-routing-v2.c`) and every
+  copy/cal/topology step lands in dmesg with byte counts — that is what
+  turned "the HAL is silent" into "the HAL wrote 1/4 of the buffer".
+- **A framework-level probe is worth its build time.** A tiny in-tree
+  `AudioTrack` tool (`audiotrack_test`, built by the device tree) exercises
+  AudioFlinger → HAL, which a tinyalsa tool cannot; pair it with a capture
+  and check the tone's energy band, not just "is there sound". The
+  capture sibling (`audiorecord_test`, same directory) records through
+  AudioFlinger into raw S16_LE and prints per-second peak/rms; play a tone
+  and record it at the same time (`audiotrack_test 8 48000 0.8 & sleep 1;
+  audiorecord_test 6 48000 /data/local/tmp/loop.raw; wait`) for an
+  end-to-end loopback, analysed on the host with
+  [`scripts/analyze-rec.py`](../../../scripts/analyze-rec.py) (peak/rms,
+  dominant frequency, stutter sidebands; needs numpy).
+- **`ACDB_DEV_TYPE_IN` is 2 in this era, not 0.** The qcom HAL header
+  (`hardware/qcom/audio/hal/audio_hw.h`) defines `ACDB_DEV_TYPE_OUT 1` and
+  `ACDB_DEV_TYPE_IN 2`; sending TX calibration with 0 makes the loader log
+  `ACDB -> Device is not RX or TX!acdb_id = %d` and return a non-zero
+  rejection (65–67), while the same ids with 2 return 0 and push blocks.
+  The loader's device list is a hardcoded RX/TX table, not a free-form id:
+  speaker 15, headphones 10 and speaker+headphones 799 are the RX entries,
+  and the mic family 4 (handset), 8 (headset), 6, 9, 35, 131, 143, 152 all
+  go through with dev_type 2. Scan it before trusting a guess —
+  `acdbtest --scan` — but know that its TX sends load blocks that kill
+  capture until reboot (next bullet) and that it needs the boot's first
+  framework stream *not* to have happened yet (one loader per boot; a
+  second init dies in `cal_block_ion_alloc: audio ION import failed,
+  rc = -22` → `-12`).
+- **Only one process can have the ACDB loader initialized per boot.** After
+  mediaserver has loaded blocks, a second `acdb_loader_init_v2` in another
+  process dies in `cal_block_ion_alloc: audio ION import failed, rc = -22`
+  → `voice_alloc_cal … failed` → init `-12`, and the first process keeps
+  the blocks. Diagnostic tools that drive the loader themselves must run
+  on a fresh boot (before the first framework stream), or expect `-12`.
+- **TX calibration can poison capture for the rest of the boot.** On maple
+  the loader accepts acdb 4 (`send_audio_cal, acdb_id = 4, path = 1, …
+  Topology Id 112fb`) but every following capture prepare dies: with the
+  HAL's own send it is the ADM (`adm_callback: cmd = 0x10326 returned
+  error = 0x1`, `msm_pcm_routing_reg_phy_stream: adm open failed
+  copp_idx:-131`, `msm_pcm_capture_prepare: stream reg failed ret:-22`,
+  `ASoC: platform prepare error: -22`), with a bare loader send and no
+  capture app-type cfg the SLIM TX backend gives up instead
+  (`msm-dai-q6-sb-0-tx: ASoC: cpu DAI prepare error: -131`,
+  `SLIMBUS_0_TX: ASoC: backend prepare failed -131`) — either way
+  `AudioRecord` hangs and a tinyalsa capture fails identically, so it is
+  the cal blocks, not the HAL. `kill -9 mediaserver` does not free them —
+  reboot only, so any TX-cal experiment (including `acdbtest --scan`)
+  belongs at the end of a session. Keep capture uncalibrated until the
+  ADM topology mismatch is understood; the RX side is unaffected (acdb
+  15/10 carry topology `112fc` and play fine).
+- **`routing=` is a signed int.** KitKat's policy sends it with
+  `param.addInt(String8(AudioParameter::keyRouting), (int)newDevice)`
+  (`hardware/libhardware_legacy/audio/AudioPolicyManagerBase.cpp`), so
+  `AUDIO_DEVICE_IN_*` values arrive negative (0x80000004 → -2147483644).
+  Parse with `str_parms_get_int` and cast the int back to `uint32_t`; a
+  `%u` sender overflows to `0x7fffffff` (INT_MAX) instead.
+- **Jack routing needs a switch-class node the kernel may not create.**
+  KitKat's `WiredAccessoryManager` watches
+  `/sys/class/switch/h2w/state`; if the codec driver only registers
+  `hdmi`/`lid`/`sim_detect` (maple's tasha kernel does), nothing ever
+  sends `routing=` for a plugged headset, and an app cannot force the
+  *input* device either because the policy re-sends its own input routing
+  at `startInput`. Build the route switch and its acdb ids anyway (RX
+  headphones 10, TX headset mic 8 from `platform.c`'s
+  `acdb_device_table[]`), but mark the headset-mic path verify-me until a
+  jack source exists.
+- **`ACDB AFE returned = -19` on a speaker cal send is benign.** The
+  Android 15 loader logs `Failed to fetch the lookup information of the
+  device 0000000F` + `ACDB_CMD_GET_AFE_COMMON_TABLE_SIZE Returned = -19`
+  / `ACDB AFE returned = -19` for dev 15 on every send and then continues
+  with `AUDIO_SET_AFE_CAL` and `send_hw_delay`; the yoshino MTP acdbdata
+  simply has no AFE common table for that device. Verified non-fatal
+  (maple: the same pair appears in runs whose audio loops back at full
+  level, e.g. TEST 52's video). Don't chase it as a calibration failure —
+  the applied AFE cal is the topology one.
+
+## Media decode lessons (maple, 2026-10-19)
+
+- **A KitKat product must supply `/system/etc/media_codecs.xml`.** The
+  4.4 `OMXCodec` asks `MediaCodecList`, which parses that file; AOSP ships
+  one only for goldfish/sdk
+  (`device/generic/goldfish/camera/media_codecs.xml`, pulled in by
+  `sdk.mk`), not for real products. Without it `initCheck()` stays
+  `NO_INIT`, `getInstance()` returns NULL, `findMatchingCodecs` stays
+  empty and `OMXCodec::Create` returns NULL for **every** compressed
+  MIME. The only dmesg evidence is
+  `MediaCodecList: unable to open media codecs configuration xml file.`
+  (ALOGW); the decisive `No matching codecs!` is ALOGV, compiled out by
+  `-DNDEBUG`.
+- **"Audio works" can mean raw PCM only.** `AwesomePlayer::initAudioDecoder`
+  bypasses OMX for `audio/raw` (`mAudioSource = mAudioTrack`), so WAV
+  plays (extractor + HAL only) while ogg/mp3/aac are silent. Test one
+  compressed file before claiming media support. The failure surfaces as
+  `UNKNOWN_ERROR` (0x80000000, java log `error (1, -2147483648)`) and,
+  for SoundPool, as `onLoadSoundEffects(), Error -22 while loading
+  samples` — `MediaPlayerService::decode`/`AudioCache` map the same
+  player error to `BAD_VALUE` (-22).
+- **List the components `SoftOMXPlugin` actually provides.** The table in
+  `frameworks/av/media/libstagefright/omx/SoftOMXPlugin.cpp` is the truth
+  (component → library + role): the soft MPEG4 library registers both
+  `OMX.google.mpeg4.decoder` and `OMX.google.h263.decoder`, `vpxdec` both
+  vp8/vp9. Don't copy a newer device's `media_codecs.xml`: its qcom
+  component names have no KitKat OMX core behind them on this port.
+  `OMX.google.raw.decoder` is added by `MediaCodecList` itself, so
+  listing it again duplicates it.
+- **The same gap disables video decode** (h264/vpx components only exist
+  through the XML), so a port without one cannot play video either —
+  worth knowing before debugging the video *output* path.
+- **Verified on maple 2026-10-19** with
+  `devices/maple/kitkat/media/media_codecs.xml` (21 `OMX.google.*`
+  components, matching the 17 soft-codec libraries in the image): Music's
+  AudioPreview plays mp3 and ogg through the HAL (route + acdb, no
+  `MediaPlayer: error`), a DMIC loopback of a 440 Hz mp3 reads 440.00 Hz,
+  and a UI click plays with no SoundPool error. Video too: Gallery's
+  `MovieActivity` on a h264+AAC clip creates `OMX.google.h264.decoder`,
+  renders the test pattern full-screen (`MediaPlayer: info/warning (3,
+  0)` = MEDIA_INFO_VIDEO_RENDERING_START) and loops its 880 Hz track
+  back through the HAL at **880.00 Hz** — decoder, GL composition and
+  audio sink all in one test. Maple TEST 52.
+
+## Newer userspace beside the old one (taimen; assessed for maple)
+
+Taimen's port runs a 64-bit Android 11 chroot (`/system/v11`) next to
+32-bit KitKat, with one bridge per KitKat HAL for the daemons KitKat
+cannot run (modem, wifi, sensors, GNSS, NFC). That design is *not*
+ported here yet, but it is the reference for every remaining maple
+subsystem; their code and our per-subsystem assessment:
+[taimen-kitkat-mapping.md](../taimen-kitkat-mapping.md). The reusable
+lessons:
+
+- **KitKat's `toolbox` has no `chroot` and its `mount` cannot
+  bind-mount.** The way in is a tiny static helper that
+  `unshare(CLONE_NEWNS)`s, makes `/` private, bind-mounts `/dev`,
+  `/proc` and `/sys` wholesale into the root, `chroot`s and execs with a
+  clean environment — deliberately *not* passing KitKat's
+  `ANDROID_PROPERTY_WORKSPACE`. Wholesale `/dev` is fine; leaving the
+  binder node out keeps HIDL from starting up inside.
+- **A 64-bit userspace can run under a 32-bit Android**: the kernel is
+  64-bit, only the userspace is old. Build chroot programs with the NDK
+  (static helpers; dynamic daemons linked against the newer bionic
+  staged *inside* the chroot) and ship the newer system's own
+  `linker64` — a real file exists in a flat system dump as
+  `system/bin/bootstrap/linker64`, next to the `/apex` symlink.
+- **Ship a whole tree through a phony module, not
+  `PRODUCT_COPY_FILES`:** `LOCAL_POST_INSTALL_CMD := cp -a <dir>
+  $(TARGET_OUT)/<where>` carries empty directories and *absolute*
+  symlinks (a vendor `rfs/` is full of them) that the copy list silently
+  cannot.
+- **Bridge the HAL library, not the HIDL service.**
+  vndservicemanager and hwservicemanager do not exist on KitKat, so a
+  HIDL service cannot start — but its implementation `.so` can be
+  `dlopen`ed in-process by a bridge, which republishes it to a KitKat
+  HAL over an abstract AF_UNIX socket with hand-rolled fixed-width
+  fields (identical layout in 32- and 64-bit processes). The version
+  skew (NCI 2.0→1.0, camera HAL 3.5→3.0, sensor flush semantics) is
+  translated in the bridge, where both sides are visible.
+- **`-rdynamic` can override a vendor library's symbol:** exporting our
+  own `getRawServiceInternal` beats libhidlbase's, so an NXP NFC
+  secure-element lookup fails fast instead of waiting forever on a
+  missing hwservicemanager.
+- **Newer daemons log to logdw, not kmsg.** Android 8+ liblog writes
+  `/dev/socket/logdw` datagrams; with no logd the chroot is silent until
+  a receiver binds that socket and forwards *warnings and errors only*
+  to `/dev/kmsg` (info floods the kernel buffer). The libhyb equivalent
+  is HIDL `getService`/`AServiceManager` stubs returning "no service"
+  immediately.
+- **Check `libqmi_cci`, not just the kernel config, before writing off a
+  QMI stack.** Modern Qualcomm userspace can be dual-transport: maple's
+  vendor `libqmi_cci.so` has `qcci_ipc_router_ops` *and*
+  `qcci_qrtr_ops` with a runtime probe, so libqmi_cci clients can fall
+  back to the legacy IPC router on a no-QRTR kernel (static,
+  verify-me).
+- **Non-root QMI clients need the IPC-router security rules**
+  (`irsc_util <vendor>/etc/sec_config`). A root client like `pdserve`
+  never notices them; a daemon running as `system` hangs without them.
+- **Modem bring-up order matters:** create `/dev/block/bootdevice/by-name`
+  links by hand (ueventd will not), have the EFS daemon and firmware
+  server running, point `firmware_class.path` at the modem partition
+  only while it boots, and hold `/dev/subsys_modem` for the life of the
+  system (maple's `modem-hold.sh`, TEST 39, is the same trick without
+  the chroot).
 
 ## Container gotchas (verified)
 
@@ -432,6 +829,10 @@ is the method reference — this doc is the KitKat delta. Back to the
 - SELinux is enforcing-era in KitKat (it was absent/permissive in Donut).
   First bringup likely needs permissive + policy audit against the 4.4
   kernel's security hooks.
+- **Defining `LOCAL_DEX_PREOPT` at all enables preoptimisation, even to
+  `false`.** KitKat's build preopts as soon as the variable is defined;
+  prebuilt apps that must stay untouched (Open GApps nano, per Taimen's
+  release build) have to omit it entirely.
 
 ## KitKat userspace on a 4.4 kernel (vs Donut on 2.6.35)
 
@@ -457,15 +858,19 @@ is the method reference — this doc is the KitKat delta. Back to the
   keyguard window's `userActivityTimeout` (10 s), and **touch input does not
   wake the screen** — a test harness must check `mScreenOn` and wake via a
   power/menu key, or it will spend an hour "testing" a dark display. Also:
-  `screencap` can return a constant image on the glrenderd stack (use fb0
+  `screencap` can return a constant image on a
+  framebuffer-presented stack (use fb0
   dumps), and `input keyevent 26` is a toggle, not "turn on".
 
 - **SERVREG_LOC (QMI 0x40) can be served from a 32-bit userspace over the
-  legacy IPC Router socket API** (maple TEST 40, 2026-10-17): even though
-  the stock 64-bit `pd-mapper` (QRTR client) cannot run on this kernel,
-  the kernel's `service-locator` client (`get_service_location` →
-  `qmi_svc_event_notifier_register(0x40, 1, 1)`) only needs *some* server
-  bound on `AF_MSM_IPC` (family 27, `SOCK_DGRAM`) with the name
+  legacy IPC Router socket API** (maple TEST 40, 2026-10-17): no chroot
+  needed — even though the stock 64-bit `pd-mapper` looked like the only
+  way (it links dual-transport `libqmi_cci`, but the earlier no-QRTR
+  verdict is why this daemon exists), the kernel's `service-locator`
+  client (`get_service_location` →
+  `qmi_svc_event_notifier_register(0x40, 1, 1)`)
+  only needs *some* server bound on `AF_MSM_IPC` (family 27,
+  `SOCK_DGRAM`) with the name
   `{service=0x40, instance=BUILD_INSTANCE_ID(1,1)=0x0101}`. A small static
   musl binary (`devices/maple/kitkat/pdserve/pdserve.c`) does this: it
   binds that name, receives the kernel's `GET_DOMAIN_LIST` request

@@ -18,6 +18,10 @@ $(call inherit-product, $(SRC_TARGET_DIR)/product/generic.mk)
 # framework-res.apk on first boot (seen 2026-10-15: OutOfMemoryError in
 # JarUtils.verifySignature every life, dalvik-cache never populates).
 $(call inherit-product, frameworks/native/build/phone-xhdpi-2048-dalvik-heap.mk)
+# stock AOSP ringtones/alarms/ui effects (frameworks/base/data/sounds/AllAudio.mk):
+# without it /system/media/audio is empty, so there are no ringtones, no UI clicks,
+# and nothing for AudioFlinger to play through audio.primary.maple.
+$(call inherit-product, frameworks/base/data/sounds/AllAudio.mk)
 
 DEVICE_PACKAGE_OVERLAYS := vendor/sony/maple/overlay
 
@@ -40,7 +44,6 @@ PRODUCT_COPY_FILES += \
     vendor/sony/maple/ueventd.maple.rc:root/ueventd.maple.rc \
     vendor/sony/maple/autowinch.sh:root/sbin/autowinch.sh \
     vendor/sony/maple/dump-boot-log.sh:system/bin/dump-boot-log.sh \
-    vendor/sony/maple/glrenderd.sh:root/sbin/glrenderd.sh \
     vendor/sony/maple/modem-hold.sh:root/sbin/modem-hold.sh \
     vendor/sony/maple/adsp-boot.sh:root/sbin/adsp-boot.sh \
     vendor/sony/maple/gpio-keys.kl:system/usr/keylayout/gpio-keys.kl \
@@ -50,14 +53,15 @@ PRODUCT_COPY_FILES += \
     vendor/sony/maple/wifi/WCNSS_qcom_cfg.ini:system/vendor/firmware/wlan/qca_cld/WCNSS_qcom_cfg.ini \
     vendor/sony/maple/audio/audio_policy.conf:system/etc/audio_policy.conf \
     vendor/sony/maple/audio/mixer_paths_tasha.xml:system/etc/mixer_paths_tasha.xml \
+    vendor/sony/maple/media/media_codecs.xml:system/etc/media_codecs.xml \
     frameworks/native/data/etc/android.hardware.wifi.xml:system/etc/permissions/android.hardware.wifi.xml
 # adsp + wlan calibration/BDF firmware blobs (modem `image/adsp.*`,
 # `image/bdwlan.*`, persist `wlan/wlan_mac.bin` — inventoried live
 # 2026-10-16) stay OUT of git (same policy as the kernel blob and the
-# glrenderd chroot: Sony/Qualcomm binaries, plus board-specific
+# Lineage closure: Sony/Qualcomm binaries, plus board-specific
 # calibration). Staged on the build server at
 # vendor/sony/maple-fw/{adsp,wlan,bt}/ (outside the sync-device-tree
-# rsync path, like vendor/sony/maple-glr); the FW_DIR block below copies
+# rsync path, like vendor/sony/maple-hyb); the FW_DIR block below copies
 # them into the image (CHARQUIRKS: firmware resolves against the
 # requester root with firmware_class.path=/vendor/firmware; a miss
 # stalls ~60 s per file in ueventd's user helper — that delay is the
@@ -65,14 +69,19 @@ PRODUCT_COPY_FILES += \
 
 # audio.primary.maple (tinyalsa HAL) + sound recorder jni (CHARQUIRKS:
 # "sound recorder needs libsrec_jni in PRODUCT_PACKAGES or it crashes").
-# media_codecs.xml ships with the stock build (software codecs) — kept.
+# media_codecs.xml is product-supplied: KitKat's MediaCodecList reads
+# /etc/media_codecs.xml and AOSP only ships one for goldfish/sdk, so without
+# it OMXCodec::Create finds no codec at all and every compressed format fails
+# with UNKNOWN_ERROR — silently at default log level ("No matching codecs!"
+# is ALOGV). Only raw PCM/WAV played before. See media/media_codecs.xml and
+# quirks TEST 52.
 PRODUCT_PACKAGES += \
     audio.primary.maple \
     libsrec_jni
 
 # Firmware blobs live out-of-git on the build server at
 # vendor/sony/maple-fw/{adsp,wlan,modem,bt}/ (pulled from the modem/bluetooth
-# partitions + persist; mirrors the kernel-blob and maple-glr precedent so
+# partitions + persist; mirrors the kernel-blob and maple-hyb precedent so
 # sync-device-tree.sh --delete leaves them alone). Copy them into the
 # image where the kernel's firmware loader looks (firmware_class.path is
 # /vendor/firmware; /vendor -> /system/vendor):
@@ -102,23 +111,56 @@ PRODUCT_COPY_FILES += \
     $(foreach f,$(shell cd $(FW_DIR)/modem && ls mba.mbn modem.mdt modem.b* wlanmdsp.mbn 2>/dev/null),$(FW_DIR)/modem/$(f):system/vendor/firmware/$(f))
 endif
 
-# glrenderd's guest side. gralloc.maple and the egl loader fall back to gralloc.default and
-# libagl whenever glrenderd isn't there
+# Graphics: the real Adreno 540 driver (Lineage 22.1 / Android 15 vendor closure) and the QTI
+# gralloc1 are loaded into every KitKat process by libhyb (hybtest probes the driver end to
+# end); gralloc.default and libGLES_android stay as the fallbacks. No glrenderd, no emulation
+# libs: KitKat's stock EGL loader picks /system/lib/egl/libEGL_adreno.so (BoardConfig +
+# egl.cfg). The emulation libs were also removed from the build (BUILD_EMULATOR_OPENGL gone),
+# so the loader can never latch the wrong driver by readdir order.
 PRODUCT_PACKAGES += \
-    libEGL_emulation \
-    libGLESv1_CM_emulation \
-    libGLESv2_emulation \
+    libhyb \
+    libEGL_adreno \
+    libGLESv1_CM_adreno \
+    libGLESv2_adreno \
     gralloc.maple \
     gralloc.default \
+    libGLES_android \
+    hybtest \
+    acdbtest \
+    audiotrack_test \
+    audiorecord_test \
+    rtc-restore \
     lights.maple \
     pdserve
 
-# glrenderd's chroot from tools/glrenderd/stage.py. it lives outside vendor/sony/maple so
-# sync-device-tree.sh's rsync --delete leaves it alone. the a540 firmware also goes where
-# kitkat's ueventd looks, in case firmware_class.path ever misses
-GLR_DIR := vendor/sony/maple-glr
-ifneq ($(wildcard $(GLR_DIR)/root/glrenderd),)
+# Lineage 22.1 (Android 15) vendor closure staged by tools/libhyb/stage.py: the Adreno 540
+# driver (vendor/lib/egl), the QTI gralloc1 (vendor/lib/hw/gralloc.default.so) and their
+# dependencies. It lives outside vendor/sony/maple so sync-device-tree.sh's rsync --delete
+# leaves it alone, and lands at /system/a15 — the root libhyb looks in (HYB_ROOT in hyb.h).
+# The a540 firmware also goes where the kernel's firmware loader looks (firmware_class.path
+# is /vendor/firmware; /vendor -> /system/vendor), same place as the modem/adsp blobs.
+HYB_DIR := vendor/sony/maple-hyb
+ifneq ($(wildcard $(HYB_DIR)/root/vendor/lib/egl/libEGL_adreno.so),)
 PRODUCT_COPY_FILES += \
-    $(foreach f,$(shell cd $(GLR_DIR) && find . -type f -printf '%P\n'),$(GLR_DIR)/$(f):system/glr/$(f)) \
-    $(foreach f,$(shell cd $(GLR_DIR)/root/vendor/firmware && ls),$(GLR_DIR)/root/vendor/firmware/$(f):system/vendor/firmware/$(f))
+    $(foreach f,$(shell cd $(HYB_DIR)/root && find . -type f -printf '%P\n'),$(HYB_DIR)/root/$(f):system/a15/$(f)) \
+    $(foreach f,$(shell cd $(HYB_DIR)/root/vendor/firmware && ls),$(HYB_DIR)/root/vendor/firmware/$(f):system/vendor/firmware/$(f))
+endif
+
+# ACDB calibration (2026-10-19): libacdbloader (staged into the a15 closure above,
+# loaded by audio.primary.maple through libhyb) builds its data path from
+# /sys/devices/soc0/hw_platform, which reads "MTP" on maple — so the yoshino
+# (Sony) calibration is staged as acdbdata/MTP and must land under that name.
+# Without it the AFE/ASM cal lookups fail and the dsp drains playback silently.
+ifneq ($(wildcard $(HYB_DIR)/acdbdata/MTP),)
+PRODUCT_COPY_FILES += \
+    $(foreach f,$(shell cd $(HYB_DIR)/acdbdata/MTP && ls),$(HYB_DIR)/acdbdata/MTP/$(f):system/vendor/etc/acdbdata/MTP/$(f))
+endif
+
+# fbpresentd: zero-copy presentation through an MDSS atomic commit (sources in fbpresentd/).
+# 64-bit, so the NDK builds it (tools/libhyb/build-native.sh) and it is staged out-of-git at
+# vendor/sony/maple-bin/, like the kernel blob. Without it gralloc.maple falls back to
+# copy + FBIOPUT_VSCREENINFO flips.
+BIN_DIR := vendor/sony/maple-bin
+ifneq ($(wildcard $(BIN_DIR)/bin/fbpresentd),)
+PRODUCT_COPY_FILES += $(BIN_DIR)/bin/fbpresentd:system/bin/fbpresentd
 endif
