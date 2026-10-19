@@ -37,3 +37,20 @@ Follow the shape of the file you are editing:
 - Keep cross-links relative (`[playbook](../porting-notes/donut.md)`, `[quirks](quirks.md)`) and keep the README Ports table, `docs/advanced/README.md` indexes, and each device page's links/status consistent if you add a doc, device, or release.
 
 No drive-by reformatting. Keep line length, bullet style, and section order of the file you touch.
+
+## This fork (Redmi K20 Pro / K40)
+
+See `FORK.md`. Rules that keep `git merge upstream/main` cheap:
+
+- raphael-only code lives in paths upstream never touches: `devices/raphael/`,
+  `docs/devices/raphael/`, `tools/raphael/`, `patches/kitkat/raphael/`. Do not put
+  raphael changes back into upstream files (`tools/libhyb/`, `patches/kitkat/*`,
+  `scripts/`), except the `raphael)` case lines in `scripts/sync-device-tree.sh`
+  and the fork note at the top of `README.md`.
+- raphael's GL stack is `tools/raphael/glrenderd/` (DRM/KMS presenter, no fbdev).
+  Upstream deleted `tools/glrenderd/` in favour of `tools/libhyb/`; do not
+  resurrect it in the upstream path.
+- Fork-specific docs (`FORK.md`, `docs/devices/raphael/**`) are written in Chinese;
+  upstream docs stay English and are translated as `*.zh-CN.md` siblings.
+- Do not commit `dumps/` (gitignored): it holds on-device ledgers, boot images and
+  serial logs. Promote durable facts into `docs/devices/raphael/quirks.md` instead.

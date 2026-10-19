@@ -51,7 +51,7 @@ PRODUCT_PACKAGES += \
     gralloc.default \
     hwcomposer.raphael
 
-# glrenderd's chroot from tools/glrenderd/stage.py. It lives outside
+# glrenderd's chroot from tools/raphael/glrenderd/stage.py. It lives outside
 # vendor/xiaomi/raphael so sync-device-tree.sh's rsync --delete leaves it
 # alone. The Adreno firmware also goes where KitKat's kernel firmware
 # loader looks (/vendor/firmware -> /system/vendor/firmware).
